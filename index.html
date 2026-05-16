@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Long Island Driver Test Locations</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="header-title">
+      <span class="header-icon">🚗</span>
+      <h1>LI Driver Test Centers</h1>
+    </div>
+    <button id="btn-practice" class="btn-primary" onclick="openPracticeModal()">
+      Practice Route
+    </button>
+  </header>
+
+  <!-- Map -->
+  <div id="map"></div>
+
+  <!-- Bottom Sheet: Location List -->
+  <div id="bottom-sheet">
+    <div id="sheet-handle" onclick="toggleSheet()">
+      <div class="handle-bar"></div>
+      <h2 id="sheet-title">Test Centers <span id="location-count"></span></h2>
+    </div>
+    <div id="sheet-content">
+      <div id="location-list"></div>
+    </div>
+  </div>
+
+  <!-- Info Panel (shown when marker clicked) -->
+  <div id="info-panel" class="hidden">
+    <button class="close-btn" onclick="closeInfoPanel()">✕</button>
+    <div id="info-content"></div>
+    <div class="info-actions">
+      <button class="btn-primary" id="btn-directions">Get Directions</button>
+      <button class="btn-secondary" id="btn-street-view">Street View</button>
+    </div>
+  </div>
+
+  <!-- Practice Route Modal -->
+  <div id="practice-modal" class="modal hidden">
+    <div class="modal-content">
+      <button class="close-btn" onclick="closePracticeModal()">✕</button>
+      <h2>🗺️ Practice Driving Route</h2>
+      <p>Enter your location and we'll build a practice driving route near you.</p>
+
+      <div class="form-group">
+        <label for="practice-address">Your starting address or location</label>
+        <input
+          type="text"
+          id="practice-address"
+          placeholder="e.g. 123 Main St, Hicksville, NY"
+          autocomplete="street-address"
+        />
+        <button class="btn-locate" onclick="useMyLocation()">📍 Use my current location</button>
+      </div>
+
+      <div class="form-group">
+        <label for="practice-duration">Approx. drive time</label>
+        <select id="practice-duration">
+          <option value="15">15 minutes</option>
+          <option value="20" selected>20 minutes</option>
+          <option value="30">30 minutes</option>
+          <option value="45">45 minutes</option>
+        </select>
+      </div>
+
+      <button class="btn-primary btn-full" onclick="generatePracticeRoute()">
+        Generate Practice Route
+      </button>
+
+      <div id="practice-status" class="hidden"></div>
+    </div>
+  </div>
+
+  <!-- Overlay -->
+  <div id="overlay" class="hidden" onclick="closeAll()"></div>
+
+  <!-- API Key Missing Banner -->
+  <div id="api-banner" class="hidden">
+    <strong>⚠️ Google Maps API Key Missing</strong><br/>
+    Open <code>config.js</code> and replace <code>YOUR_API_KEY_HERE</code> with your key.
+  </div>
+
+  <script src="config.js"></script>
+  <script src="locations.js"></script>
+  <script src="app.js"></script>
+  <script>
+    function loadGoogleMaps() {
+      if (!GOOGLE_MAPS_API_KEY || GOOGLE_MAPS_API_KEY === 'YOUR_API_KEY_HERE') {
+        document.getElementById('api-banner').classList.remove('hidden');
+        return;
+      }
+      const script = document.createElement('script');
+      script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&libraries=places&callback=initMap`;
+      script.async = true;
+      script.defer = true;
+      document.head.appendChild(script);
+    }
+    window.addEventListener('load', loadGoogleMaps);
+  </script>
+</body>
+</html>
