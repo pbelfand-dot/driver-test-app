@@ -56,7 +56,8 @@
       if (!pts.length) continue;
       const last = path[path.length - 1];
       const dup = last && Math.abs(last.lat - pts[0].lat) < 1e-7 && Math.abs(last.lng - pts[0].lng) < 1e-7;
-      out.push({ index: dup ? path.length - 1 : path.length, maneuver: st.maneuver, instruction: st.instruction });
+      const { path: _ignored, ...details } = st;
+      out.push(Object.assign({ index: dup ? path.length - 1 : path.length }, details));
       for (let i = dup ? 1 : 0; i < pts.length; i++) path.push(pts[i]);
     }
     if (path.length < 2) return { path: (fallbackPath || []).map(toLL), steps: [], duration };
@@ -150,10 +151,16 @@
     for (const leg of r.legs || []) {
       for (const st of leg.steps || []) {
         const maneuver = osrmManeuver(st.maneuver || {});
+        const first = st.intersections && st.intersections[0];
         steps.push({
           path: ((st.geometry && st.geometry.coordinates) || []).map(([lng, lat]) => ({ lat, lng })),
           maneuver,
           instruction: osrmInstruction(st, maneuver),
+          name: st.name || st.ref || '',
+          exit: (st.maneuver && st.maneuver.exit) || null,
+          ramp: st.maneuver && st.maneuver.type === 'off ramp' ? 'off' : st.maneuver && st.maneuver.type === 'on ramp' ? 'on' : null,
+          // Turn lanes at the maneuver: [{indications: ['left', 'straight'], valid: true}, …]
+          lanes: first && Array.isArray(first.lanes) && first.lanes.length ? first.lanes : null,
         });
       }
     }

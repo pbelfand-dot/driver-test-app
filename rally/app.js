@@ -14,6 +14,7 @@
   const N = window.RallyNotes;
   const P = window.MapProviders;
   const MV = window.RallyMapView;
+  const G = window.Guidance;
   const $ = id => document.getElementById(id);
 
   const RAD = Math.PI / 180;
@@ -50,6 +51,8 @@
     avoidHighways: false,
     radio: true,
     mixMusic: false,   // true: callouts mix with music, but the iPhone silent switch mutes them
+    navVoice: true,    // spoken turn-by-turn directions
+    rallyVoice: true,  // rally pace-note calls
   }, readStore('rally.settings', {}));
 
   const saveSettings = () => writeStore('rally.settings', settings);
@@ -99,6 +102,10 @@
     lastReroute: -Infinity,
     view: 'chase',     // 'chase' (canvas) | 'map' (street map)
     endArmed: false,
+    guide: [],         // turn-by-turn maneuvers (guidance.js)
+    prompter: null,
+    navIdx: 0,
+    shownNav: null,
   };
 
   // ── Formatting ──
@@ -599,35 +606,84 @@
       }, 400);
     });
     input.addEventListener('blur', () => setTimeout(hide, 150));
+    // Recent destinations when the box is empty, like any navigation app.
+    if (key === 'destination') {
+      input.addEventListener('focus', () => {
+        if (input.value.trim().length >= 3) return;
+        const recent = readStore('rally.recent', []);
+        if (!recent.length) return;
+        list.innerHTML = '';
+        for (const r of recent) {
+          const li = document.createElement('li');
+          li.className = 'recent';
+          li.textContent = r.label;
+          li.addEventListener('pointerdown', e => {
+            e.preventDefault();
+            input.value = r.label;
+            picked.destination = r;
+            hide();
+          });
+          list.appendChild(li);
+        }
+        list.classList.remove('hidden');
+      });
+    }
+  }
+
+  function rememberDestination(place) {
+    if (!place || place.lat === undefined || !place.label) return;
+    const recent = readStore('rally.recent', []).filter(r => r.label !== place.label);
+    recent.unshift({ label: place.label, lat: place.lat, lng: place.lng });
+    writeStore('rally.recent', recent.slice(0, 6));
   }
 
   // ── Street maps ──
 
-  const maps = { google: null, leaflet: null, active: null };
+  // Free maps only: MapLibre + OpenFreeMap (rotates with your heading), or
+  // Leaflet + OpenStreetMap tiles on phones without WebGL.
+  const maps = { gl: undefined, leaflet: null, active: null };
 
   function mapFor(route) {
     if (!route || route.synthetic) return null;
-    if (route.provider === 'google' && HAS_KEY) return maps.google || (maps.google = MV.googleMap($('gmap'), loadMaps));
+    if (maps.gl === undefined) maps.gl = MV.glSupported() ? MV.glMap($('gmap')) : null;
+    if (maps.gl) return maps.gl;
     if (!window.L) return null;
     return maps.leaflet || (maps.leaflet = MV.leafletMap($('lmap')));
   }
 
   async function showMapIn(slotId) {
-    const m = mapFor(state.route);
+    let m = mapFor(state.route);
     if (!m) throw new Error('No map');
-    await m.ready();
-    $(slotId).appendChild($(m.kind === 'google' ? 'gmap' : 'lmap'));
+    try {
+      await m.ready();
+    } catch (err) {
+      if (m.kind !== 'gl' || !window.L) throw err;
+      console.warn('Vector map unavailable; using Leaflet', err);
+      maps.gl = null;
+      m = mapFor(state.route);
+      await m.ready();
+    }
+    $(slotId).appendChild(m.container);
     m.resize();
-    maps.active = m;
+    if (maps.active !== m) {
+      m.onUserMove(() => $('btn-recenter').classList.toggle('hidden', state.screen !== 'drive'));
+      maps.active = m;
+    }
     return m;
   }
 
-  function updateMapCar(s) {
+  let lastFollow = 0;
+
+  function updateMapCar(s, force) {
     const m = maps.active;
     if (!m || state.view !== 'map') return;
-    const p = N.pointAt(state.stage.samples, s);
-    m.setCar(p, N.headingAt(state.stage.samples, s, 15));
-    m.follow(p);
+    const now = performance.now();
+    const every = state.mode === 'sim' ? 500 : 1000;
+    if (!force && now - lastFollow < every) return;
+    lastFollow = now;
+    const S = state.stage.samples;
+    m.setProgress(s);
+    m.follow(N.pointAt(S, s), N.headingAt(S, s, 15), state.speed, every);
   }
 
   // ── Canvas stage views ──
@@ -864,9 +920,15 @@
     const angle = n.kind === 'keep' || n.kind === 'ramp' ? 30 : Math.max(25, Math.min(180, n.angle || 90));
     const r = GLYPH_RADIUS[n.kind === 'corner' ? n.grade : n.kind] || 30;
     const mods = n.mods || [];
-    const r0 = mods.includes('opens') ? r * 0.5 : r;
-    const r1 = mods.includes('tightens') ? r * 0.45 : r;
-    const sign = n.dir === 'R' ? 1 : -1;
+    return curvedArrowSVG(n.dir, angle, r, color,
+      mods.includes('opens') ? r * 0.5 : r,
+      mods.includes('tightens') ? r * 0.45 : r);
+  }
+
+  // An arrow that comes up from the bottom and bends `angle` degrees left or
+  // right; r0/r1 = bend radius at the start/end (tightening or opening).
+  function curvedArrowSVG(dir, angle, r, color, r0 = r, r1 = r) {
+    const sign = dir === 'L' ? -1 : 1;
 
     // Walk the shape: approach straight, the arc, a short exit. y points up.
     let x = 0, y = 34, h = 0;
@@ -920,6 +982,7 @@
     const stage = N.buildStage(route);
     state.route = route;
     state.stage = stage;
+    state.simTotal = null;
     show('brief');
     renderBrief();
   }
@@ -1057,10 +1120,11 @@
       finished: false,
       endArmed: false,
     });
+    startGuidance(stage);
 
     show('drive');
     chase.setStage(stage);
-    setView('chase');
+    setView(mapFor(state.route) ? 'map' : 'chase');
     $('sim-badge').classList.toggle('hidden', mode !== 'sim');
     $('gps-chip').classList.toggle('hidden', mode !== 'gps');
     $('btn-speed').classList.toggle('hidden', mode !== 'sim');
@@ -1068,6 +1132,7 @@
     $('stat-speed-unit').textContent = speedUnit();
     $('stat-left-unit').textContent = `${distUnit()} left`;
     $('limit-sign').classList.add('hidden');
+    $('btn-recenter').classList.add('hidden');
     setAlert(null);
     requestWakeLock();
 
@@ -1140,8 +1205,12 @@
 
     // In fast-forward the voice still talks at normal speed, so warn earlier.
     const schedSpeed = state.mode === 'sim' ? state.speed * state.simRate : state.speed;
+    for (const p of settings.navVoice && state.prompter ? state.prompter.update(pos.s, schedSpeed) : []) {
+      coDriver.say(p.text, () => state.s > p.s + 10);
+    }
     for (const call of state.scheduler.update(pos.s, schedSpeed)) {
       state.lastCall = call.text;
+      if (!settings.rallyVoice) continue;
       coDriver.say(call.text, () => state.s > call.start + 5);
       const card = $('note-card');
       card.classList.remove('flash');
@@ -1176,8 +1245,13 @@
         shownNote: null,
         s: 0,
       });
+      startGuidance(stage);
       chase.setStage(stage);
-      if (maps.active && mapFor(route) === maps.active) maps.active.drawStage(stage, MAP_STYLE);
+      if (maps.active && mapFor(route) === maps.active) {
+        maps.active.drawStage(stage, MAP_STYLE);
+        maps.active.track(true);
+        updateMapCar(0, true);
+      }
       setAlert(null);
       coDriver.say('New route. Notes on.');
     } catch (err) {
@@ -1205,8 +1279,6 @@
     updateHud(s);
     state.raf = requestAnimationFrame(frame);
   }
-
-  let lastMapPan = 0;
 
   function updateHud(s) {
     const { stage } = state;
@@ -1242,14 +1314,111 @@
     $('stat-top').textContent = state.topSpeed > 0 ? `top ${toSpeedUnit(state.topSpeed)}` : '';
     if (state.mode === 'gps') updateGpsChip(stale);
     updateLimit(s, stale);
-    $('stat-time').textContent = fmtClock(elapsed());
     $('stat-left').textContent = toDistUnit(Math.max(0, stage.length - s)).toFixed(1);
     $('progress-bar').style.width = `${Math.min(100, (s / stage.length) * 100)}%`;
+    updateNav(s);
+    updateMapCar(s);
+  }
 
-    if (state.view === 'map' && now - lastMapPan > 500) {
-      lastMapPan = now;
-      updateMapCar(s);
+  // ── Turn-by-turn ──
+
+  // The rally call already says "Square right" at this junction: don't also
+  // say "Turn right" at the turn (the earlier prompts still name the street).
+  function rallyCoversTurn(m) {
+    return settings.rallyVoice && state.stage.notes.some(n => n.junction && n.dir === m.dir && Math.abs(n.apex - m.s) < 35);
+  }
+
+  function startGuidance(stage) {
+    state.guide = G.maneuvers(stage, state.route.destLabel || (state.route.synthetic ? 'the finish' : null));
+    state.prompter = new G.Prompter(state.guide, { units: settings.units, skipNow: rallyCoversTurn });
+    state.navIdx = 0;
+    state.shownNav = null;
+  }
+
+  function remainingSeconds(s) {
+    const { route, stage } = state;
+    const total = route.duration || (state.simTotal || (state.simTotal = estimateSimTime(stage)));
+    return total * Math.max(0, stage.length - s) / stage.length;
+  }
+
+  let lastEta = '';
+
+  function updateNav(s) {
+    const guide = state.guide;
+    const banner = $('nav-banner');
+    if (!guide.length) {
+      banner.classList.add('hidden');
+      return;
     }
+    state.navIdx = G.nextIndex(guide, s, state.navIdx);
+    const m = guide[state.navIdx];
+    banner.classList.remove('hidden');
+    if (state.shownNav !== m) {
+      state.shownNav = m;
+      $('nav-arrow').innerHTML = navArrowSVG(m);
+      $('nav-text').textContent = G.instruction(m);
+      const after = guide[state.navIdx + 1];
+      const then = $('nav-then');
+      if (after && after.s - m.s < 300) {
+        then.innerHTML = `<span>Then</span>${navArrowSVG(after)}`;
+        then.classList.remove('hidden');
+      } else {
+        then.classList.add('hidden');
+      }
+    }
+    const d = m.s - s;
+    const dist = G.displayDistance(d, settings.units);
+    if ($('nav-dist').textContent !== dist.value) $('nav-dist').textContent = dist.value;
+    if ($('nav-dist-unit').textContent !== dist.unit) $('nav-dist-unit').textContent = dist.unit;
+    const lanes = $('nav-lanes');
+    const showLanes = m.lanes && d < 1000;
+    if (showLanes && lanes.dataset.for !== String(state.navIdx)) {
+      lanes.dataset.for = String(state.navIdx);
+      lanes.innerHTML = m.lanes.map(l => laneSVG((l.indications || ['straight'])[0], l.valid)).join('');
+    }
+    lanes.classList.toggle('hidden', !showLanes);
+
+    const road = G.roadAt(state.stage, s);
+    const roadEl = $('road-name');
+    if (roadEl.textContent !== road) roadEl.textContent = road;
+    roadEl.classList.toggle('hidden', !road);
+
+    // Arrival time, minutes left.
+    const left = remainingSeconds(s);
+    const eta = new Date(Date.now() + left * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    const sub = left >= 3600 ? `${Math.floor(left / 3600)} h ${Math.round((left % 3600) / 60)} min` : `${Math.max(0, Math.round(left / 60))} min`;
+    if (eta + sub !== lastEta) {
+      lastEta = eta + sub;
+      $('stat-eta').textContent = eta.replace(/\s?[AP]M$/i, '');
+      $('stat-eta-sub').textContent = sub;
+    }
+  }
+
+  // White maneuver arrow for the green banner.
+  function navArrowSVG(m) {
+    const k = m.maneuver;
+    if (k === 'ARRIVE') {
+      return '<svg viewBox="0 0 100 100"><path d="M50 92 C50 92 20 58 20 38 a30 30 0 0 1 60 0 C80 58 50 92 50 92 Z" fill="#fff"/><circle cx="50" cy="38" r="11" fill="#13803f"/></svg>';
+    }
+    if (/^ROUNDABOUT/.test(k)) {
+      return `<svg viewBox="0 0 100 100"><circle cx="50" cy="42" r="22" fill="none" stroke="#fff" stroke-width="9"/>
+        <line x1="50" y1="96" x2="50" y2="64" stroke="#fff" stroke-width="9" stroke-linecap="round"/>
+        <text x="50" y="51" text-anchor="middle" font-size="26" font-weight="800" fill="#fff" font-family="${FONT}">${m.exit || ''}</text></svg>`;
+    }
+    const angle = /SLIGHT|FORK|KEEP|RAMP/.test(k) ? 40 : /SHARP/.test(k) ? 135 : /UTURN/.test(k) ? 180 : /MERGE|FERRY|STRAIGHT/.test(k) ? 0 : 90;
+    return curvedArrowSVG(m.dir || 'R', angle, angle >= 180 ? 14 : 22, '#fff');
+  }
+
+  // One lane: an arrow for its direction, bright if it is a lane for this maneuver.
+  const LANE_ANGLE = { 'sharp left': -135, left: -90, 'slight left': -45, straight: 0, none: 0, 'slight right': 45, right: 90, 'sharp right': 135, uturn: -180 };
+  function laneSVG(indication, valid) {
+    const a = (LANE_ANGLE[indication] !== undefined ? LANE_ANGLE[indication] : 0) * RAD;
+    const x = 20 + Math.sin(a) * 12, y = 20 - Math.cos(a) * 12;
+    const hx = Math.sin(a) * 6, hy = -Math.cos(a) * 6;
+    const px = Math.cos(a) * 5, py = Math.sin(a) * 5;
+    const color = valid ? '#fff' : 'rgba(255,255,255,0.35)';
+    return `<svg viewBox="0 0 40 44" class="lane"><path d="M20 42 V20 L${x.toFixed(1)} ${y.toFixed(1)}" fill="none" stroke="${color}" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <polygon points="${(x + hx).toFixed(1)},${(y + hy).toFixed(1)} ${(x + px).toFixed(1)},${(y + py).toFixed(1)} ${(x - px).toFixed(1)},${(y - py).toFixed(1)}" fill="${color}"/></svg>`;
   }
 
   // Posted speed limit (from OpenStreetMap) and the speedo turning red above it.
@@ -1294,18 +1463,27 @@
     const map = view === 'map';
     $('chase').classList.toggle('hidden', map);
     $('map-slot-drive').classList.toggle('hidden', !map);
+    $('btn-overview').classList.toggle('hidden', !map);
+    if (!map) $('btn-recenter').classList.add('hidden');
     $('btn-view').firstChild.textContent = map ? '◭' : '🗺';
-    $('btn-view').lastChild.textContent = map ? 'Notes' : 'Map';
+    $('btn-view').lastChild.textContent = map ? 'Rally' : 'Map';
     if (map) {
       try {
         const m = await showMapIn('map-slot-drive');
-        const p = N.pointAt(state.stage.samples, state.s);
-        m.follow(p, 17);
-        updateMapCar(state.s);
+        m.track(true);
+        updateMapCar(state.s, true);
       } catch (e) {
+        console.warn('Map view unavailable', e);
         setView('chase');
       }
     }
+  }
+
+  function recenter() {
+    if (!maps.active) return;
+    maps.active.track(true);
+    $('btn-recenter').classList.add('hidden');
+    updateMapCar(state.s, true);
   }
 
   function stopDrive() {
@@ -1395,6 +1573,7 @@
       });
       writeStore('rally.lastDestination', destText);
       writeStore('rally.lastOrigin', originText);
+      rememberDestination(Object.assign({}, route.destinationPoint, { label: to.label || to.text }));
       setStatus('');
       loadStage(route);
     } catch (err) {
@@ -1471,6 +1650,13 @@
       settings.radio = e.target.checked;
       saveSettings();
     });
+    for (const [id, key] of [['nav-voice', 'navVoice'], ['rally-voice', 'rallyVoice']]) {
+      $(id).checked = !!settings[key];
+      $(id).addEventListener('change', e => {
+        settings[key] = e.target.checked;
+        saveSettings();
+      });
+    }
     $('mix-music').checked = !!settings.mixMusic;
     $('mix-music').addEventListener('change', e => {
       settings.mixMusic = e.target.checked;
@@ -1522,6 +1708,12 @@
     $('btn-repeat').addEventListener('click', repeat);
     $('note-card').addEventListener('click', repeat);
     $('btn-view').addEventListener('click', () => setView(state.view === 'map' ? 'chase' : 'map'));
+    $('btn-recenter').addEventListener('click', recenter);
+    $('btn-overview').addEventListener('click', () => {
+      if (!maps.active) return;
+      maps.active.overview();
+      $('btn-recenter').classList.remove('hidden');
+    });
     $('btn-speed').addEventListener('click', () => {
       state.simRate = SIM_RATES[(SIM_RATES.indexOf(state.simRate) + 1) % SIM_RATES.length];
       $('btn-speed').firstChild.textContent = `${state.simRate}×`;

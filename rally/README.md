@@ -1,8 +1,10 @@
 # Rally Co-Driver GPS
 
-A phone app that turns any drive into a rally stage. Type where you're going and
-it finds the route, reads the road shape, and a co-driver calls the corners out
-over a radio intercom as you drive: **"5 right, 100, 3 left into 2 right, 400"**.
+A phone navigation app that turns any drive into a rally stage. Type where
+you're going and it finds the fastest route and guides you turn by turn like
+any navigation app ("In 500 feet, turn right onto Main Street"), on a map that
+follows your car. On top of that, a co-driver calls the corners out over a radio
+intercom as you drive: **"5 right, 100, 3 left into 2 right, 400"**.
 
 It also calls traffic lights, stop signs, speed cameras, rail crossings and speed
 bumps, and shows the posted speed limit next to a GPS speedometer that turns red
@@ -39,6 +41,18 @@ Open it from the new icon and allow **Location** when asked.
    pace-note book (tap any line to hear it).
 3. **▶ Start stage** and drive. Keep the app open with the screen on (mount the
    phone); it keeps the screen awake by itself. Go off route and it recalculates.
+
+While driving:
+
+- **Green banner:** the next turn, distance to it, lane arrows (when mapped) and
+  the turn after it if it comes right away.
+- **Map:** turns with you (heading up) and tilts like other navigation apps.
+  Drag it to look around, then tap **Re-center**; **⤢** shows the whole route.
+  **Rally** switches to the rally-game road view (and **Map** back).
+- **Bottom bar:** speed (red above the posted limit), arrival time with minutes
+  left, distance left. The road you're on is shown above it.
+- **Voice:** spoken directions plus rally pace notes; either can be turned off
+  in Co-driver settings. Works in portrait and landscape (car mount).
 4. **Simulate drive** plays the stage at your desk. The **Demo stage** on the
    first screen needs no address at all.
 
@@ -82,7 +96,7 @@ With no setup the app uses free OpenStreetMap services:
 | Address search | Photon (photon.komoot.io), Nominatim as backup |
 | Routing | OSRM on FOSSGIS `routing.openstreetmap.de` (OSRM demo server as backup) |
 | Lights, signs, cameras, speed limits | Overpass API (`overpass-api.de`) |
-| Map | OpenStreetMap standard tiles via Leaflet |
+| Map | OpenFreeMap vector tiles via MapLibre (free, no key, no request limits per OpenFreeMap); OpenStreetMap tiles via Leaflet on phones without WebGL |
 
 These are community servers for **light, personal use**: about one route and a
 few look-ups per drive is fine. Sharing the app widely would need your own
@@ -90,7 +104,10 @@ servers or paid providers. Coverage depends on what volunteers have mapped:
 some lights, cameras or speed limits will be missing — fix them at
 openstreetmap.org.
 
-**Optional Google routing:** put a Google Maps Platform key in `../config.js`
+Everything above is free. No traffic data: free sources don't offer live traffic.
+
+**Optional Google routing (not free beyond Google's monthly allowance; needs a
+billing account):** put a Google Maps Platform key in `../config.js`
 (enable *Maps JavaScript API* and *Routes API*, and restrict the key to your
 site). Routes then come from Google, falling back to OpenStreetMap if Google
 fails. Road features still come from OpenStreetMap.
@@ -120,8 +137,11 @@ node --test rally/test/*.test.js # unit tests
 | `pacenotes.js` | Pace-note engine: corner detection and grading, call chaining, GPS tracking, speed filter, simulator |
 | `providers.js` | OpenStreetMap services: search, OSRM routing, Overpass road features |
 | `voicepack.js` | Radio intercom effect, voice-pack loading, stitching and rendering |
-| `mapview.js` | Google Maps / Leaflet map views |
+| `guidance.js` | Turn-by-turn: maneuvers, distances, spoken prompts, road names |
+| `mapview.js` | Navigation map (MapLibre + OpenFreeMap) and Leaflet fallback |
 | `app.js` | Screens, routing flow, co-driver queue, HUD |
 | `demo-stage.js` | Made-up test road used by the demo and the tests |
 | `sw.js`, `manifest.webmanifest`, `icons/` | Installable app + offline start |
+| `vendor/maplibre/` | MapLibre GL JS 5.24.0 (BSD-3-Clause) |
 | `vendor/leaflet/` | Leaflet 1.9.4 (BSD-2-Clause) |
+| `voice/` | Recorded co-driver clips (copied in by `.github/workflows/voice-pack.yml`) |

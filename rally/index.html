@@ -13,6 +13,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,500;0,700;0,800;1,800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="vendor/maplibre/maplibre-gl.css" />
   <link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
   <link rel="stylesheet" href="rally.css" />
 </head>
@@ -77,6 +78,14 @@
         </div>
       </div>
       <label class="toggle">
+        <input id="nav-voice" type="checkbox" checked />
+        <span>Spoken directions <small class="sub">"In 500 feet, turn right onto Main Street"</small></span>
+      </label>
+      <label class="toggle">
+        <input id="rally-voice" type="checkbox" checked />
+        <span>Rally pace notes <small class="sub">"3 left, 100, 2 right tightens 1"</small></span>
+      </label>
+      <label class="toggle">
         <input id="radio" type="checkbox" checked />
         <span>Radio intercom effect (mic clicks &amp; static)</span>
       </label>
@@ -128,6 +137,15 @@
   <!-- ── Drive HUD ────────────────────────────────────── -->
   <section id="screen-drive" class="screen">
     <div class="hud-top">
+      <div id="nav-banner" class="nav-banner hidden">
+        <div id="nav-arrow" class="nav-arrow"></div>
+        <div class="nav-body">
+          <div class="nav-dist"><b id="nav-dist">0</b><span id="nav-dist-unit">ft</span></div>
+          <div id="nav-text" class="nav-text"></div>
+          <div id="nav-lanes" class="nav-lanes hidden"></div>
+        </div>
+        <div id="nav-then" class="nav-then hidden"></div>
+      </div>
       <div id="note-card" class="note-card">
         <div id="note-glyph" class="glyph"></div>
         <div class="note-body">
@@ -147,13 +165,16 @@
       <div id="sim-badge" class="sim-badge hidden">SIMULATION</div>
       <div id="gps-chip" class="gps-chip hidden">GPS</div>
       <div id="limit-sign" class="limit-sign hidden"><span>SPEED<br />LIMIT</span><b id="limit-value">--</b></div>
+      <button id="btn-overview" class="map-btn map-btn-overview hidden" aria-label="Route overview">⤢</button>
+      <button id="btn-recenter" class="map-btn map-btn-recenter hidden">➤ Re-center</button>
+      <div id="road-name" class="road-name hidden"></div>
     </div>
 
     <div class="hud-bottom">
       <div class="progress"><div id="progress-bar"></div></div>
       <div class="stats">
         <div class="speed"><b id="stat-speed">0</b><span id="stat-speed-unit">mph</span><small id="stat-top"></small></div>
-        <div><b id="stat-time">0:00</b><span>time</span></div>
+        <div><b id="stat-eta">--:--</b><span id="stat-eta-sub">arrival</span></div>
         <div><b id="stat-left">0.0</b><span id="stat-left-unit">mi left</span></div>
       </div>
       <div class="controls">
@@ -184,8 +205,10 @@
   <script src="pacenotes.js"></script>
   <script src="demo-stage.js"></script>
   <script src="voicepack.js"></script>
+  <script src="vendor/maplibre/maplibre-gl.js"></script>
   <script src="vendor/leaflet/leaflet.js"></script>
   <script src="providers.js"></script>
+  <script src="guidance.js"></script>
   <script src="mapview.js"></script>
   <script src="app.js"></script>
 </body>

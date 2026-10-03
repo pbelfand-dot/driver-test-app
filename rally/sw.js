@@ -4,7 +4,7 @@
  * the last good copy is served when offline. Google Maps and routing requests
  * are never cached; they always go to the network.
  */
-const CACHE = 'rally-v2';
+const CACHE = 'rally-v3';
 const SHELL = [
   './',
   'index.html',
@@ -14,7 +14,10 @@ const SHELL = [
   'demo-stage.js',
   'voicepack.js',
   'providers.js',
+  'guidance.js',
   'mapview.js',
+  'vendor/maplibre/maplibre-gl.js',
+  'vendor/maplibre/maplibre-gl.css',
   'vendor/leaflet/leaflet.js',
   'vendor/leaflet/leaflet.css',
   'manifest.webmanifest',

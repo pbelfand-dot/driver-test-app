@@ -363,8 +363,17 @@
     return w ? words.indexOf(w[1].toLowerCase()) + 1 : null;
   }
 
-  // Steps → [{s, maneuver, dir, instruction, street}], s = metres from route start.
-  function normalizeSteps(steps, rawPath) {
+  // Name of the road a step travels on: "Turn left onto Main St" / "Head north on Elm Rd".
+  function roadName(instruction) {
+    const onto = parseStreet(instruction);
+    if (onto) return onto;
+    const m = /\bon ([^.,]+?)(?:\s+(?:toward|for)\b.*)?$/i.exec(stripHtml(instruction));
+    return m ? m[1].trim() : null;
+  }
+
+  // Every route step with its distance from the start:
+  // [{s, maneuver, dir, instruction, street, name, exit, lanes, ramp}].
+  function stepsAlong(steps, rawPath) {
     if (!steps || !steps.length) return [];
     let cum = null;
     return steps.map(st => {
@@ -383,8 +392,18 @@
         dir: maneuverDir(maneuver),
         instruction: stripHtml(st.instruction),
         street: parseStreet(st.instruction),
+        name: st.name || roadName(st.instruction),
+        exit: st.exit || parseExit(st.instruction),
+        lanes: st.lanes || null,
+        ramp: st.ramp || null,
       };
-    }).filter(st => st.maneuver && !/^(DEPART|STRAIGHT|NAME_CHANGE|MANEUVER_UNSPECIFIED)$/.test(st.maneuver));
+    });
+  }
+
+  // The steps that matter for pace notes (turns, forks, roundabouts…).
+  function normalizeSteps(steps, rawPath) {
+    return stepsAlong(steps, rawPath)
+      .filter(st => st.maneuver && !/^(DEPART|STRAIGHT|NAME_CHANGE|MANEUVER_UNSPECIFIED)$/.test(st.maneuver));
   }
 
   function applyManeuvers(corners, steps, o) {
@@ -657,6 +676,7 @@
     if (samples.length < 3 || length < 20) throw new Error('Route is too short to build pace notes.');
 
     const dh = headingChanges(samples);
+    const allSteps = stepsAlong(route.steps, route.path);
     const steps = normalizeSteps(route.steps, route.path);
     const raw = detectCorners(samples, dh, o);
     const { corners, events } = applyManeuvers(raw, steps, o);
@@ -694,6 +714,7 @@
       notes,
       calls,
       limits: placeLimits(index, route.limitWays || [], o),
+      steps: allSteps,
       stats: {
         corners: cornersOnly.length,
         perKm: km > 0 ? cornersOnly.length / km : 0,
