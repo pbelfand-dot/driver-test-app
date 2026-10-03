@@ -9,8 +9,17 @@ const DemoStage = require('../demo-stage.js');
 const { overpassFor } = require('./fixtures.js');
 const P = require('../providers.js');
 
-const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'voice', 'manifest.json'), 'utf8'));
-const have = new Set(Object.keys(manifest.clips));
+const voiceDir = path.join(__dirname, '..', 'voice');
+const manifest = JSON.parse(fs.readFileSync(path.join(voiceDir, 'manifest.json'), 'utf8'));
+// Clips are either stored locally (a list of names) or listed as URLs (name → file).
+const local = Array.isArray(manifest.clips);
+const have = new Set(local ? manifest.clips : Object.keys(manifest.clips));
+
+test('every clip in a local voice pack exists', { skip: !local }, () => {
+  for (const name of manifest.clips) {
+    assert.ok(fs.existsSync(path.join(voiceDir, `${name}.${manifest.format}`)), `missing ${name}.${manifest.format}`);
+  }
+});
 
 test('calls split into recorded words', () => {
   assert.deepEqual(V.tokenize('Caution, 2 right opens, 300'), ['caution', ',', '2', 'right', 'opens', ',', '300']);
