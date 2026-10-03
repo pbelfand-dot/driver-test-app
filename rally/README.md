@@ -18,10 +18,11 @@ when you're over it.
 The app is a website that installs like an app (full screen, its own icon). It
 needs to be served over HTTPS, and GitHub Pages does that for free:
 
-1. On GitHub open **pbelfand-dot/driver-test-app → Settings → Pages**.
+1. On GitHub open **pbelfand-dot/driver-test-app → Settings → Pages**
+   (https://github.com/pbelfand-dot/driver-test-app/settings/pages).
 2. Under **Build and deployment**, set **Source: Deploy from a branch**, pick the
-   branch that has the `rally/` folder (e.g. `claude/focused-johnson-xpi0q4`),
-   folder **/ (root)**, and **Save**.
+   default branch `claude/google-maps-driver-tests-QJdsy`, folder **/ (root)**,
+   and **Save**.
 3. After a minute the app is live at
    **https://pbelfand-dot.github.io/driver-test-app/rally/**
 
