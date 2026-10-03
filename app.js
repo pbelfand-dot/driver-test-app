@@ -1,35 +1,22 @@
-let map, directionsService, directionsRenderer, geocoder;
-let markers = [];
-let activeLocation = null;
-let practiceOriginLatLng = null;
+// Long Island driver test centers map. Free: OpenStreetMap map tiles (Leaflet),
+// address search and driving routes from rally/providers.js — no API key.
+let map, routeLayer;
+let practiceOrigin = null;   // {lat, lng} when "Use my current location" was tapped
 let sheetExpanded = false;
 
 // Long Island center
-const LI_CENTER = { lat: 40.789, lng: -73.135 };
+const LI_CENTER = [40.789, -73.135];
+const COUNTY_COLORS = { Nassau: '#4285f4', Suffolk: '#34a853' };
+const Places = window.MapProviders;
 
 function initMap() {
-  map = new google.maps.Map(document.getElementById('map'), {
-    center: LI_CENTER,
-    zoom: 10,
-    mapTypeControl: false,
-    fullscreenControl: false,
-    streetViewControl: false,
-    zoomControl: true,
-    zoomControlOptions: {
-      position: google.maps.ControlPosition.RIGHT_CENTER
-    },
-    styles: [
-      { featureType: 'poi', elementType: 'labels', stylers: [{ visibility: 'off' }] }
-    ]
-  });
-
-  directionsService = new google.maps.DirectionsService();
-  directionsRenderer = new google.maps.DirectionsRenderer({
-    suppressMarkers: false,
-    polylineOptions: { strokeColor: '#1a73e8', strokeWeight: 5 }
-  });
-  directionsRenderer.setMap(map);
-  geocoder = new google.maps.Geocoder();
+  map = L.map('map', { zoomControl: false }).setView(LI_CENTER, 10);
+  L.control.zoom({ position: 'topright' }).addTo(map);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · Routes: OSRM',
+  }).addTo(map);
+  routeLayer = L.layerGroup().addTo(map);
 
   addLegend();
   plotLocations();
@@ -40,32 +27,18 @@ function initMap() {
 }
 
 function plotLocations() {
-  const nassauIcon = makeIcon('#4285f4');
-  const suffolkIcon = makeIcon('#34a853');
-
   LOCATIONS.forEach(loc => {
-    const marker = new google.maps.Marker({
-      position: { lat: loc.lat, lng: loc.lng },
-      map,
-      title: loc.name,
-      icon: loc.county === 'Nassau' ? nassauIcon : suffolkIcon,
-      animation: google.maps.Animation.DROP
-    });
-
-    marker.addListener('click', () => showLocationInfo(loc, marker));
-    markers.push({ marker, loc });
+    L.circleMarker([loc.lat, loc.lng], {
+      radius: 10,
+      fillColor: COUNTY_COLORS[loc.county],
+      fillOpacity: 1,
+      color: 'white',
+      weight: 2
+    })
+      .addTo(map)
+      .bindTooltip(loc.name)
+      .on('click', () => showLocationInfo(loc));
   });
-}
-
-function makeIcon(color) {
-  return {
-    path: google.maps.SymbolPath.CIRCLE,
-    scale: 10,
-    fillColor: color,
-    fillOpacity: 1,
-    strokeColor: 'white',
-    strokeWeight: 2
-  };
 }
 
 function buildLocationList() {
@@ -84,8 +57,7 @@ function buildLocationList() {
       <span class="loc-county-badge">${loc.county}</span>
     `;
     card.addEventListener('click', () => {
-      map.panTo({ lat: loc.lat, lng: loc.lng });
-      map.setZoom(14);
+      map.setView([loc.lat, loc.lng], 14);
       showLocationInfo(loc);
       collapseSheet();
     });
@@ -94,8 +66,6 @@ function buildLocationList() {
 }
 
 function showLocationInfo(loc) {
-  activeLocation = loc;
-
   document.getElementById('info-content').innerHTML = `
     <h3>${loc.name}</h3>
     <div class="info-row"><strong>📍</strong><span>${loc.address}</span></div>
@@ -112,76 +82,65 @@ function showLocationInfo(loc) {
 
 function closeInfoPanel() {
   document.getElementById('info-panel').classList.add('hidden');
-  directionsRenderer.setDirections({ routes: [] });
-  activeLocation = null;
+  routeLayer.clearLayers();
 }
 
 function getDirectionsToLocation(loc) {
   if (navigator.geolocation) {
     navigator.geolocation.getCurrentPosition(
-      pos => {
-        const origin = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-        routeTo(origin, { lat: loc.lat, lng: loc.lng });
-      },
-      () => promptAddressForDirections(loc)
+      pos => routeTo({ lat: pos.coords.latitude, lng: pos.coords.longitude }, loc),
+      () => promptAddressForDirections(loc),
+      { enableHighAccuracy: true, timeout: 15000 }
     );
   } else {
     promptAddressForDirections(loc);
   }
 }
 
-function promptAddressForDirections(loc) {
+async function findPlace(address) {
+  const found = await Places.searchPlaces(`${address}, Long Island, NY`, { lat: LI_CENTER[0], lng: LI_CENTER[1] }, 1);
+  return found[0] || null;
+}
+
+async function promptAddressForDirections(loc) {
   const addr = prompt('Enter your starting address:');
   if (!addr) return;
-  geocoder.geocode({ address: addr + ', Long Island, NY' }, (results, status) => {
-    if (status === 'OK') {
-      routeTo(results[0].geometry.location, { lat: loc.lat, lng: loc.lng });
-    } else {
-      alert('Could not find that address. Try being more specific.');
-    }
-  });
+  try {
+    const place = await findPlace(addr);
+    if (!place) throw new Error('not found');
+    routeTo(place, loc);
+  } catch (e) {
+    alert('Could not find that address. Try being more specific.');
+  }
 }
 
-function routeTo(origin, destination) {
-  directionsService.route(
-    {
-      origin,
-      destination,
-      travelMode: google.maps.TravelMode.DRIVING
-    },
-    (result, status) => {
-      if (status === 'OK') {
-        directionsRenderer.setDirections(result);
-        const leg = result.routes[0].legs[0];
-        const panel = document.getElementById('info-content');
-        const tripInfo = document.createElement('div');
-        tripInfo.className = 'info-row';
-        tripInfo.style.marginTop = '8px';
-        tripInfo.style.padding = '8px';
-        tripInfo.style.background = '#e8f0fe';
-        tripInfo.style.borderRadius = '8px';
-        tripInfo.innerHTML = `
-          <strong>🚗</strong>
-          <span>${leg.distance.text} · ${leg.duration.text}</span>
-        `;
-        panel.appendChild(tripInfo);
-      } else {
-        alert('Could not get directions. Please try again.');
-      }
-    }
-  );
+function drawRoute(route) {
+  routeLayer.clearLayers();
+  const line = L.polyline(route.path.map(p => [p.lat, p.lng]), { color: '#1a73e8', weight: 5, opacity: 0.9 }).addTo(routeLayer);
+  map.fitBounds(line.getBounds(), { padding: [30, 30] });
 }
 
+const tripText = route => `${(route.distance / 1609.344).toFixed(1)} mi · ${Math.round(route.duration / 60)} min`;
+
+async function routeTo(origin, destination) {
+  try {
+    const route = await Places.routeOsrm(origin, { lat: destination.lat, lng: destination.lng });
+    drawRoute(route);
+    const panel = document.getElementById('info-content');
+    const old = panel.querySelector('.trip-info');
+    if (old) old.remove();
+    const tripInfo = document.createElement('div');
+    tripInfo.className = 'info-row trip-info';
+    tripInfo.innerHTML = `<strong>🚗</strong><span>${tripText(route)}</span>`;
+    panel.appendChild(tripInfo);
+  } catch (e) {
+    alert('Could not get directions. Please try again.');
+  }
+}
+
+// Street-level photos open in Google Maps (a free link, no key needed).
 function openStreetView(loc) {
-  const sv = new google.maps.StreetViewPanorama(
-    document.getElementById('map'),
-    {
-      position: { lat: loc.lat, lng: loc.lng },
-      pov: { heading: 0, pitch: 0 },
-      zoom: 1
-    }
-  );
-  map.setStreetView(sv);
+  window.open(`https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${loc.lat},${loc.lng}`, '_blank', 'noopener');
 }
 
 // ── Bottom Sheet ──
@@ -204,7 +163,6 @@ function collapseSheet() {
 function openPracticeModal() {
   document.getElementById('practice-modal').classList.remove('hidden');
   document.getElementById('overlay').classList.remove('hidden');
-  document.getElementById('practice-status').classList.add('hidden');
   document.getElementById('practice-status').className = 'hidden';
 }
 
@@ -225,26 +183,18 @@ function useMyLocation() {
   }
   navigator.geolocation.getCurrentPosition(
     pos => {
-      practiceOriginLatLng = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-      geocoder.geocode({ location: practiceOriginLatLng }, (results, status) => {
-        if (status === 'OK' && results[0]) {
-          document.getElementById('practice-address').value = results[0].formatted_address;
-        } else {
-          document.getElementById('practice-address').value =
-            `${pos.coords.latitude.toFixed(5)}, ${pos.coords.longitude.toFixed(5)}`;
-        }
-      });
+      practiceOrigin = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      document.getElementById('practice-address').value =
+        `My location (${practiceOrigin.lat.toFixed(5)}, ${practiceOrigin.lng.toFixed(5)})`;
     },
-    err => {
-      alert('Could not get your location. Please type your address instead.');
-    }
+    () => alert('Could not get your location. Please type your address instead.'),
+    { enableHighAccuracy: true, timeout: 15000 }
   );
 }
 
-function generatePracticeRoute() {
+async function generatePracticeRoute() {
   const address = document.getElementById('practice-address').value.trim();
-  const minutes = parseInt(document.getElementById('practice-duration').value);
-  const status = document.getElementById('practice-status');
+  const minutes = parseInt(document.getElementById('practice-duration').value, 10);
 
   if (!address) {
     showStatus('Please enter your starting address or use your current location.', true);
@@ -253,71 +203,36 @@ function generatePracticeRoute() {
 
   showStatus('Building your practice route...', false);
 
-  const resolveOrigin = (callback) => {
-    if (practiceOriginLatLng && document.getElementById('practice-address').value.includes(',')) {
-      callback(practiceOriginLatLng);
-    } else {
-      geocoder.geocode({ address: address }, (results, gStatus) => {
-        if (gStatus === 'OK') {
-          const latlng = {
-            lat: results[0].geometry.location.lat(),
-            lng: results[0].geometry.location.lng()
-          };
-          callback(latlng);
-        } else {
-          showStatus('Could not find that address. Try adding the city and state.', true);
-        }
-      });
+  let origin = practiceOrigin && address.startsWith('My location') ? practiceOrigin : null;
+  if (!origin) {
+    try {
+      origin = await findPlace(address);
+    } catch (e) {
+      origin = null;
     }
-  };
+    if (!origin) {
+      showStatus('Could not find that address. Try adding the city and state.', true);
+      return;
+    }
+  }
 
-  resolveOrigin(origin => {
-    // Build a loop route: origin → waypoint A → waypoint B → origin
-    // Distance per leg based on minutes (avg ~25 mph in suburban LI)
-    const milesPerMin = 25 / 60;
-    const totalMiles = milesPerMin * minutes;
-    const legMiles = totalMiles / 3;
-    const legDeg = legMiles / 69; // rough degrees
+  // Loop route: origin → waypoint A → waypoint B → origin.
+  // Distance per leg based on minutes (avg ~25 mph in suburban LI).
+  const milesPerMin = 25 / 60;
+  const legDeg = (milesPerMin * minutes) / 3 / 69; // rough degrees
+  const via = [
+    { lat: origin.lat + legDeg, lng: origin.lng + legDeg * 0.5 },
+    { lat: origin.lat + legDeg * 0.3, lng: origin.lng - legDeg * 0.8 }
+  ];
 
-    const waypoints = [
-      { lat: origin.lat + legDeg, lng: origin.lng + legDeg * 0.5 },
-      { lat: origin.lat + legDeg * 0.3, lng: origin.lng - legDeg * 0.8 }
-    ];
-
-    directionsService.route(
-      {
-        origin,
-        destination: origin,
-        waypoints: waypoints.map(wp => ({
-          location: new google.maps.LatLng(wp.lat, wp.lng),
-          stopover: false
-        })),
-        travelMode: google.maps.TravelMode.DRIVING,
-        optimizeWaypoints: true
-      },
-      (result, routeStatus) => {
-        if (routeStatus === 'OK') {
-          directionsRenderer.setDirections(result);
-
-          const legs = result.routes[0].legs;
-          const totalDist = legs.reduce((sum, l) => sum + l.distance.value, 0);
-          const totalTime = legs.reduce((sum, l) => sum + l.duration.value, 0);
-          const distMi = (totalDist / 1609).toFixed(1);
-          const timeMins = Math.round(totalTime / 60);
-
-          showStatus(
-            `✅ Practice route ready! ${distMi} miles · ~${timeMins} min drive.\nTap the map to follow the blue route.`,
-            false
-          );
-
-          closePracticeModal();
-          map.fitBounds(result.routes[0].bounds);
-        } else {
-          showStatus('Could not build a route from that location. Make sure you\'re on Long Island!', true);
-        }
-      }
-    );
-  });
+  try {
+    const route = await Places.routeOsrm(origin, origin, { via });
+    drawRoute(route);
+    showStatus(`✅ Practice route ready! ${tripText(route)} drive.\nTap the map to follow the blue route.`, false);
+    closePracticeModal();
+  } catch (e) {
+    showStatus('Could not build a route from that location. Make sure you\'re on Long Island!', true);
+  }
 }
 
 function showStatus(msg, isError) {
@@ -328,17 +243,18 @@ function showStatus(msg, isError) {
 }
 
 function addLegend() {
-  const legend = document.createElement('div');
-  legend.id = 'legend';
-  legend.innerHTML = `
-    <div class="legend-item">
-      <div class="legend-dot" style="background:#4285f4"></div>
-      <span>Nassau County</span>
-    </div>
-    <div class="legend-item">
-      <div class="legend-dot" style="background:#34a853"></div>
-      <span>Suffolk County</span>
-    </div>
-  `;
-  map.controls[google.maps.ControlPosition.BOTTOM_LEFT].push(legend);
+  const legend = L.control({ position: 'bottomleft' });
+  legend.onAdd = () => {
+    const div = L.DomUtil.create('div');
+    div.id = 'legend';
+    div.innerHTML = Object.keys(COUNTY_COLORS).map(county => `
+      <div class="legend-item">
+        <div class="legend-dot" style="background:${COUNTY_COLORS[county]}"></div>
+        <span>${county} County</span>
+      </div>`).join('');
+    return div;
+  };
+  legend.addTo(map);
 }
+
+document.addEventListener('DOMContentLoaded', initMap);

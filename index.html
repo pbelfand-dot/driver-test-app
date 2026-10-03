@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Long Island Driver Test Locations</title>
+  <link rel="stylesheet" href="rally/vendor/leaflet/leaflet.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -14,9 +15,12 @@
       <span class="header-icon">🚗</span>
       <h1>LI Driver Test Centers</h1>
     </div>
-    <button id="btn-practice" class="btn-primary" onclick="openPracticeModal()">
-      Practice Route
-    </button>
+    <div class="header-actions">
+      <a href="rally/" class="btn-secondary btn-rally">🏁 Rally</a>
+      <button id="btn-practice" class="btn-primary" onclick="openPracticeModal()">
+        Practice Route
+      </button>
+    </div>
   </header>
 
   <!-- Map -->
@@ -57,6 +61,7 @@
           id="practice-address"
           placeholder="e.g. 123 Main St, Hicksville, NY"
           autocomplete="street-address"
+          oninput="practiceOrigin = null"
         />
         <button class="btn-locate" onclick="useMyLocation()">📍 Use my current location</button>
       </div>
@@ -82,28 +87,9 @@
   <!-- Overlay -->
   <div id="overlay" class="hidden" onclick="closeAll()"></div>
 
-  <!-- API Key Missing Banner -->
-  <div id="api-banner" class="hidden">
-    <strong>⚠️ Google Maps API Key Missing</strong><br/>
-    Open <code>config.js</code> and replace <code>YOUR_API_KEY_HERE</code> with your key.
-  </div>
-
-  <script src="config.js"></script>
   <script src="locations.js"></script>
+  <script src="rally/vendor/leaflet/leaflet.js"></script>
+  <script src="rally/providers.js"></script>
   <script src="app.js"></script>
-  <script>
-    function loadGoogleMaps() {
-      if (!GOOGLE_MAPS_API_KEY || GOOGLE_MAPS_API_KEY === 'YOUR_API_KEY_HERE') {
-        document.getElementById('api-banner').classList.remove('hidden');
-        return;
-      }
-      const script = document.createElement('script');
-      script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&libraries=places&callback=initMap`;
-      script.async = true;
-      script.defer = true;
-      document.head.appendChild(script);
-    }
-    window.addEventListener('load', loadGoogleMaps);
-  </script>
 </body>
 </html>

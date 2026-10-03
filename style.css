@@ -52,6 +52,27 @@ header {
 
 .header-icon { font-size: 22px; }
 
+.header-title { min-width: 0; }
+
+header h1 {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.header-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+@media (max-width: 420px) {
+  header .btn-primary,
+  header .btn-secondary { padding: 8px 10px; font-size: 13px; }
+}
+
+.btn-rally {
+  text-decoration: none;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
 header h1 {
   font-size: 17px;
   font-weight: 600;
@@ -68,9 +89,12 @@ header h1 {
 }
 
 /* ── Bottom Sheet ── */
+/* Collapsed, only the top --sheet-peek shows; tapping the handle slides it up. */
 #bottom-sheet {
   position: fixed;
-  bottom: 0; left: 0; right: 0;
+  left: 0; right: 0;
+  height: 80vh;
+  bottom: calc(var(--sheet-peek) - 80vh);
   z-index: 90;
   background: var(--surface);
   border-radius: 20px 20px 0 0;
@@ -376,33 +400,8 @@ header h1 {
 }
 #overlay.hidden { display: none; }
 
-/* ── API Banner ── */
-#api-banner {
-  position: fixed;
-  top: calc(var(--header-height) + 8px);
-  left: 12px; right: 12px;
-  z-index: 110;
-  background: #fff3cd;
-  border: 1px solid #ffc107;
-  border-radius: 10px;
-  padding: 12px 14px;
-  font-size: 13px;
-  color: #664d03;
-  line-height: 1.5;
-}
-
-#api-banner code {
-  background: rgba(0,0,0,0.08);
-  padding: 1px 4px;
-  border-radius: 3px;
-  font-size: 12px;
-}
-
 /* ── Legend ── */
 #legend {
-  position: absolute;
-  bottom: 8px;
-  left: 8px;
   background: white;
   border-radius: 8px;
   padding: 8px 10px;
