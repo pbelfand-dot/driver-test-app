@@ -1,0 +1,9 @@
+{
+  "name": "driver-test-app",
+  "private": true,
+  "description": "Long Island driver test centers map and a rally co-driver GPS (rally/).",
+  "scripts": {
+    "start": "npx http-server -p 8080 -c-1 .",
+    "test": "node --test rally/test/*.test.js"
+  }
+}

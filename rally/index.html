@@ -13,6 +13,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,500;0,700;0,800;1,800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
   <link rel="stylesheet" href="rally.css" />
 </head>
 <body>
@@ -32,10 +33,12 @@
           <input id="origin" type="text" placeholder="Current location" autocomplete="street-address" />
           <button type="button" id="btn-here" class="chip-btn" title="Use my current location">📍 Here</button>
         </div>
+        <ul id="suggest-origin" class="suggest hidden"></ul>
       </label>
       <label class="field">
         <span>To</span>
-        <input id="destination" type="text" placeholder="Address, place or town" required />
+        <input id="destination" type="text" placeholder="Address, place or town" autocomplete="off" required />
+        <ul id="suggest-destination" class="suggest hidden"></ul>
       </label>
       <label class="toggle">
         <input id="avoid-highways" type="checkbox" />
@@ -45,11 +48,8 @@
       <p id="setup-status" class="status" role="status"></p>
     </form>
 
-    <button id="btn-demo" class="btn btn-ghost">Demo stage <small>no key needed</small></button>
-    <p id="key-hint" class="hint hidden">
-      Routing needs a Google Maps API key. Put it in <code>config.js</code> and enable
-      <b>Maps JavaScript API</b> and <b>Routes API</b> for it. The demo stage works without one.
-    </p>
+    <p id="key-hint" class="hint"></p>
+    <button id="btn-demo" class="btn btn-ghost">Demo stage <small>try it at your desk</small></button>
 
     <details class="panel settings">
       <summary>Co-driver settings</summary>
@@ -80,6 +80,10 @@
         <input id="radio" type="checkbox" checked />
         <span>Radio intercom effect (mic clicks &amp; static)</span>
       </label>
+      <label class="toggle">
+        <input id="mix-music" type="checkbox" />
+        <span>Keep my music playing <small class="sub">iPhone: the silent switch then mutes the co-driver</small></span>
+      </label>
       <button type="button" id="btn-test-voice" class="btn btn-small">▶ Test voice</button>
     </details>
 
@@ -92,6 +96,7 @@
         <li><b>tightens / opens</b> the bend gets slower / faster on the way through</li>
         <li><b>100, 200…</b> metres of straight to the next note · <b>into / and</b> right after</li>
         <li><b>Caution</b> slow bend at the end of a long straight</li>
+        <li><b class="ghz">Lights, Stop sign, Speed camera, Rail crossing, Bump</b> from OpenStreetMap</li>
       </ul>
       <p class="safety">Notes describe the road's shape, not a safe speed. Obey speed limits and traffic laws, and keep your eyes on the road.</p>
     </aside>
@@ -108,13 +113,16 @@
       <canvas id="overview" class="stage-canvas"></canvas>
     </div>
     <div class="brief-stats" id="brief-stats"></div>
+    <p id="brief-note" class="brief-note"></p>
     <div class="brief-actions">
       <button id="btn-start" class="btn btn-go">▶ Start stage</button>
       <button id="btn-sim" class="btn btn-alt">Simulate drive</button>
-      <a id="btn-gmaps" class="btn btn-ghost" target="_blank" rel="noopener">Open in Google Maps</a>
+      <a id="btn-gmaps" class="btn btn-ghost btn-small" target="_blank" rel="noopener">Google Maps</a>
+      <a id="btn-waze" class="btn btn-ghost btn-small" target="_blank" rel="noopener">Waze <small>cop alerts</small></a>
     </div>
     <h3 class="book-title">Pace notes <small>tap to hear a call</small></h3>
     <ol id="book" class="book"></ol>
+    <p id="attrib" class="attrib"></p>
   </section>
 
   <!-- ── Drive HUD ────────────────────────────────────── -->
@@ -138,6 +146,7 @@
       <div id="countdown" class="countdown hidden"></div>
       <div id="sim-badge" class="sim-badge hidden">SIMULATION</div>
       <div id="gps-chip" class="gps-chip hidden">GPS</div>
+      <div id="limit-sign" class="limit-sign hidden"><span>SPEED<br />LIMIT</span><b id="limit-value">--</b></div>
     </div>
 
     <div class="hud-bottom">
@@ -169,11 +178,15 @@
   </section>
 
   <div id="gmap" class="gmap"></div>
+  <div id="lmap" class="gmap"></div>
 
   <script src="../config.js"></script>
   <script src="pacenotes.js"></script>
   <script src="demo-stage.js"></script>
   <script src="voicepack.js"></script>
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script src="providers.js"></script>
+  <script src="mapview.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

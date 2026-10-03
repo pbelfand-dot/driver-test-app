@@ -39,6 +39,9 @@
     maxNotesPerCall: 3,
     maxCalledGap: 1000,    // longer straights are not announced as a distance (m)
     junctionSnap: 35,      // match Google maneuvers to geometric corners within (m)
+    hazardSnap: 10,        // road features (lights, signs…) must be this close to the route (m)
+    cameraSnap: 25,        // speed cameras are often mapped beside the road (m)
+    limitSnap: 10,         // speed-limit road segments must run this close to the route (m)
   };
 
   // Upper bound of the driving-line radius (m) for grades 1..6.
@@ -440,6 +443,9 @@
 
   // ── Text ──────────────────────────────────────────────────
 
+  const HAZARD_WORDS = { lights: 'Lights', stop: 'Stop sign', camera: 'Speed camera', railway: 'Rail crossing', bump: 'Bump' };
+  const HAZARD_CODES = { lights: 'LIGHTS', stop: 'STOP', camera: 'CAMERA', railway: 'RAIL', bump: 'BUMP' };
+
   function niceDistance(m) {
     let best = NICE_DISTANCES[0];
     for (const d of NICE_DISTANCES) if (Math.abs(d - m) < Math.abs(best - m)) best = d;
@@ -470,8 +476,9 @@
       case 'merge': t = 'Merge'; break;
       case 'ferry': t = 'Ferry'; break;
       case 'finish': t = 'Finish'; break;
-      default: t = '';
+      default: t = HAZARD_WORDS[n.kind] || '';
     }
+    if (n.at) t += ` at ${HAZARD_WORDS[n.at].toLowerCase()}`;
     return n.caution ? `Caution, ${t.charAt(0).toLowerCase()}${t.slice(1)}` : t;
   }
 
@@ -488,7 +495,7 @@
       case 'merge': return 'MERGE';
       case 'ferry': return 'FERRY';
       case 'finish': return 'FINISH';
-      default: return '';
+      default: return HAZARD_CODES[n.kind] || '';
     }
   }
 
@@ -515,6 +522,126 @@
     return calls;
   }
 
+  // ── Road features from map data ───────────────────────────
+
+  // Grid of route segments for fast "where is this point on the route" lookups.
+  class RouteIndex {
+    constructor(samples, cell = 100) {
+      this.samples = samples;
+      this.cell = cell;
+      const o = samples[0];
+      this.ky = EARTH_R * RAD;
+      this.kx = this.ky * Math.cos(o.lat * RAD);
+      this.o = o;
+      this.grid = new Map();
+      for (let i = 0; i < samples.length - 1; i++) {
+        const [x, y] = this.xy(samples[i]);
+        const key = `${Math.floor(x / cell)},${Math.floor(y / cell)}`;
+        if (!this.grid.has(key)) this.grid.set(key, []);
+        this.grid.get(key).push(i);
+      }
+    }
+
+    xy(p) {
+      return [(p.lng - this.o.lng) * this.kx, (p.lat - this.o.lat) * this.ky];
+    }
+
+    // Nearest point on the route within maxD metres → {s, d} or null.
+    nearest(p, maxD) {
+      const [x, y] = this.xy(p);
+      const cx = Math.floor(x / this.cell), cy = Math.floor(y / this.cell);
+      const reach = Math.ceil(maxD / this.cell);
+      let best = null;
+      for (let gx = cx - 1 - reach; gx <= cx + 1 + reach; gx++) {
+        for (let gy = cy - 1 - reach; gy <= cy + 1 + reach; gy++) {
+          const list = this.grid.get(`${gx},${gy}`);
+          if (!list) continue;
+          for (const i of list) {
+            const r = projectOnSegment(p, this.samples[i], this.samples[i + 1]);
+            if (r.d <= maxD && (!best || r.d < best.d)) best = r;
+          }
+        }
+      }
+      return best;
+    }
+  }
+
+  // OSM maxspeed tag → {value, unit, mps}; null for "none", "signals", etc.
+  function parseMaxspeed(v) {
+    if (v === undefined || v === null) return null;
+    const m = /^(\d+(?:\.\d+)?)\s*(mph|km\/h|kmh|kph|knots)?$/i.exec(String(v).split(';')[0].trim());
+    if (!m) return null;
+    const n = +m[1];
+    const unit = (m[2] || 'km/h').toLowerCase();
+    if (unit === 'mph') return { value: n, unit: 'mph', mps: n * 0.44704 };
+    if (unit === 'knots') return { value: n, unit: 'knots', mps: n * 0.514444 };
+    return { value: n, unit: 'km/h', mps: n / 3.6 };
+  }
+
+  // hazards: [{lat, lng, kind}] → [{kind, s}] on the route, nearby duplicates merged.
+  function placeHazards(index, hazards, o) {
+    const placed = [];
+    for (const h of hazards) {
+      const hit = index.nearest(h, h.kind === 'camera' ? o.cameraSnap : o.hazardSnap);
+      if (hit) placed.push({ kind: h.kind, s: hit.s });
+    }
+    placed.sort((a, b) => a.s - b.s);
+    return placed.filter((h, i) => !placed.slice(0, i).some(p => p.kind === h.kind && h.s - p.s < 40));
+  }
+
+  // ways: [{maxspeed, geometry: [{lat, lng}]}] → sorted [{start, end, value, unit, mps}].
+  // A way segment counts when both ends sit on the route and it runs along it
+  // (cross streets touch the route at one point only).
+  function placeLimits(index, ways, o) {
+    const spans = [];
+    for (const w of ways) {
+      const limit = parseMaxspeed(w.maxspeed);
+      const g = w.geometry || [];
+      if (!limit || g.length < 2) continue;
+      for (let k = 0; k < g.length - 1; k++) {
+        const a = index.nearest(g[k], o.limitSnap);
+        const b = a && index.nearest(g[k + 1], o.limitSnap);
+        if (!a || !b) continue;
+        const len = haversine(g[k], g[k + 1]);
+        if (Math.abs(a.s - b.s) < 0.6 * len) continue;
+        spans.push(Object.assign({ start: Math.min(a.s, b.s), end: Math.max(a.s, b.s) }, limit));
+      }
+    }
+    spans.sort((a, b) => a.start - b.start);
+    const merged = [];
+    for (const sp of spans) {
+      const last = merged[merged.length - 1];
+      if (last && last.mps === sp.mps && sp.start - last.end < 40) last.end = Math.max(last.end, sp.end);
+      else merged.push(Object.assign({}, sp));
+    }
+    return merged;
+  }
+
+  // Speed limit at distance s along the stage, or null when unknown.
+  function limitAt(stage, s) {
+    const L = stage.limits || [];
+    let found = null;
+    for (const sp of L) {
+      if (sp.start > s + 5) break;
+      if (s <= sp.end + 15) found = sp;
+    }
+    return found;
+  }
+
+  // Lights or a stop sign right at a junction turn become part of that note
+  // ("Square left at lights"); everything else is a note of its own.
+  function mergeHazards(notes, hazards) {
+    const out = notes.slice();
+    for (const h of hazards) {
+      if (h.kind === 'lights' || h.kind === 'stop') {
+        const turn = notes.find(n => n.type === 'corner' && n.junction && !n.at && h.s >= n.start - 35 && h.s <= n.apex + 10);
+        if (turn) { turn.at = h.kind; continue; }
+      }
+      out.push({ type: 'event', kind: h.kind, start: h.s, end: h.s, apex: h.s });
+    }
+    return out;
+  }
+
   // ── Stage ─────────────────────────────────────────────────
 
   /*
@@ -534,7 +661,9 @@
     const raw = detectCorners(samples, dh, o);
     const { corners, events } = applyManeuvers(raw, steps, o);
 
-    const notes = corners.map(c => classify(c, o)).filter(Boolean).concat(events);
+    const index = new RouteIndex(samples);
+    const hazards = placeHazards(index, route.hazards || [], o);
+    const notes = mergeHazards(corners.map(c => classify(c, o)).filter(Boolean).concat(events), hazards);
     notes.sort((a, b) => a.start - b.start);
     notes.push({ type: 'event', kind: 'finish', start: length, end: length, apex: length });
 
@@ -564,11 +693,13 @@
       length,
       notes,
       calls,
+      limits: placeLimits(index, route.limitWays || [], o),
       stats: {
         corners: cornersOnly.length,
         perKm: km > 0 ? cornersOnly.length / km : 0,
         hairpins: cornersOnly.filter(n => n.kind === 'hairpin').length,
         squares: cornersOnly.filter(n => n.kind === 'square').length,
+        hazards: hazards.length,
       },
     };
   }
@@ -819,6 +950,9 @@
     noteText,
     parseExit,
     parseStreet,
+    parseMaxspeed,
+    limitAt,
+    RouteIndex,
     SpeedFilter,
     Tracker,
     CallScheduler,

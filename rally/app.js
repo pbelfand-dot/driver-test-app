@@ -1,11 +1,19 @@
 /*
- * Rally Co-Driver GPS: screens, Google Maps routing, the co-driver voice and
- * the driving HUD. The pace-note maths lives in pacenotes.js.
+ * Rally Co-Driver GPS: screens, routing, the co-driver voice and the driving
+ * HUD. Pace-note maths lives in pacenotes.js, free OpenStreetMap services in
+ * providers.js, street maps in mapview.js and audio in voicepack.js.
+ *
+ * Routing: Google Maps when config.js has an API key, otherwise (or if Google
+ * fails) free OpenStreetMap routing. Either way the route is checked against
+ * OpenStreetMap for traffic lights, stop signs, speed cameras, rail crossings,
+ * speed bumps and speed limits.
  */
 (function () {
   'use strict';
 
   const N = window.RallyNotes;
+  const P = window.MapProviders;
+  const MV = window.RallyMapView;
   const $ = id => document.getElementById(id);
 
   const RAD = Math.PI / 180;
@@ -13,6 +21,8 @@
   const TIMING = { early: 7, normal: 5, late: 3.5 };   // seconds of warning before a corner
   const SIM_RATES = [1, 2, 4];
   const GRADE_COLORS = { 1: '#ff2d2d', 2: '#ff6a00', 3: '#ffa200', 4: '#ffd500', 5: '#9be15d', 6: '#3ddc84' };
+  const HAZARD_COLORS = { lights: '#ff6961', stop: '#ff3b30', camera: '#bf5af2', railway: '#ffd60a', bump: '#64d2ff' };
+  const HAZARD_SHORT = { lights: 'Lights', stop: 'Stop', camera: 'Camera', railway: 'Rail', bump: 'Bump' };
 
   const KEY = typeof GOOGLE_MAPS_API_KEY === 'string' ? GOOGLE_MAPS_API_KEY.trim() : '';
   const HAS_KEY = !!KEY && KEY !== 'YOUR_API_KEY_HERE';
@@ -39,18 +49,33 @@
     units: /^en-US\b/i.test(navigator.language || '') ? 'mph' : 'kmh',
     avoidHighways: false,
     radio: true,
+    mixMusic: false,   // true: callouts mix with music, but the iPhone silent switch mutes them
   }, readStore('rally.settings', {}));
+
+  const saveSettings = () => writeStore('rally.settings', settings);
 
   const intercom = new window.CoDriverAudio.Intercom();
   const voicePack = new window.CoDriverAudio.VoicePack('voice/');
 
-  const saveSettings = () => writeStore('rally.settings', settings);
+  // Calls from the recorded voice pack play through one <audio> element: on an
+  // iPhone that is what reaches CarPlay and plays with the silent switch on.
+  const player = new Audio();
+  player.setAttribute('playsinline', '');
+  player.preload = 'auto';
+  let playerUrl = null;
+
+  // Last known position, to rank address suggestions nearest-first.
+  let lastPos = readStore('rally.lastPos', null);
+  function rememberPos(p) {
+    lastPos = { lat: +p.lat.toFixed(4), lng: +p.lng.toFixed(4) };
+    writeStore('rally.lastPos', lastPos);
+  }
 
   // ── App state ──
 
   const state = {
     screen: 'setup',
-    route: null,       // {path, steps, duration, name, origin, destination, synthetic}
+    route: null,       // {path, steps, duration, provider, name, destinationPoint, hazards, limitWays…}
     stage: null,       // RallyNotes.buildStage(route)
     mode: null,        // 'gps' | 'sim'
     tracker: null,
@@ -69,11 +94,10 @@
     noteIdx: 0,
     shownNote: null,
     lastCall: '',
-    callsMade: 0,
     finished: false,
     rerouting: false,
     lastReroute: -Infinity,
-    view: 'chase',     // 'chase' (canvas) | 'map' (Google map)
+    view: 'chase',     // 'chase' (canvas) | 'map' (street map)
     endArmed: false,
   };
 
@@ -99,6 +123,7 @@
   const fmtDist = (m, digits = 1) => `${toDistUnit(m).toFixed(digits)} ${distUnit()}`;
   const toSpeedUnit = mps => Math.round(mps * MPS_TO[settings.units]);
   const speedUnit = () => (settings.units === 'mph' ? 'mph' : 'km/h');
+  const shortPlace = label => String(label || '').split(',')[0].trim();
 
   function noteColor(n) {
     switch (n.kind) {
@@ -106,7 +131,7 @@
       case 'hairpin': return GRADE_COLORS[1];
       case 'square': return '#ff5a36';
       case 'finish': return '#ffffff';
-      default: return '#4fc3f7';
+      default: return HAZARD_COLORS[n.kind] || '#4fc3f7';
     }
   }
 
@@ -124,10 +149,17 @@
       case 'keep': t = `Keep ${d}`; break;
       case 'ramp': t = `Ramp ${d}`; break;
       case 'roundabout': t = n.exit ? `Roundabout ${n.exit}` : 'Roundabout'; break;
-      default: t = n.text;
+      default: t = HAZARD_SHORT[n.kind] || n.text;
     }
+    if (n.at) t += ` · ${HAZARD_SHORT[n.at].toLowerCase()}`;
     return n.caution ? `⚠ ${t}` : t;
   }
+
+  const MAP_STYLE = {
+    color: noteColor,
+    label: n => (n.kind === 'finish' ? '🏁' : shortLabel(n).replace('⚠ ', '')),
+    priority: n => (n.kind === 'finish' ? -1 : severity(n)),
+  };
 
   function pill(n, label = shortLabel(n)) {
     const el = document.createElement('span');
@@ -166,6 +198,9 @@
     playing: null,
     muted: false,
     unlocked: false,
+    mediaUnlocked: false,
+    mediaBlocked: false,   // the browser refused <audio> playback: use the phone voice
+    streamBroken: false,   // voice clips couldn't be downloaded: use the phone voice
     watchdog: null,
 
     get supported() {
@@ -185,7 +220,21 @@
 
     // Call synchronously inside a tap: phones only allow sound that a tap started.
     unlock() {
+      // iPhone (Safari 16.4+): "playback" is heard with the silent switch on but
+      // pauses other audio; "ambient" mixes with music but the switch mutes it.
+      const type = settings.mixMusic ? 'ambient' : 'playback';
+      try {
+        if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type;
+      } catch (e) { /* not supported */ }
       intercom.ensure();
+      this.mediaBlocked = false;
+      this.streamBroken = false;
+      if (!this.mediaUnlocked && !settings.mixMusic) {
+        this.mediaUnlocked = true;
+        player.src = window.CoDriverAudio.silentWavUrl();
+        const p = player.play();
+        if (p && p.catch) p.catch(() => { this.mediaUnlocked = false; });
+      }
       if (!this.unlocked && this.supported) {
         const u = new SpeechSynthesisUtterance(' ');
         u.volume = 0;
@@ -206,7 +255,8 @@
     // isStale(): checked right before speaking, so calls for corners already
     // driven past are skipped instead of read late.
     say(text, isStale) {
-      if (this.muted || !this.supported || !text) return;
+      if (this.muted || !text) return;
+      if (!this.supported && !voicePack.loaded) return;
       this.queue.push({ text, isStale });
       this.pump();
     },
@@ -217,8 +267,15 @@
       while (item && item.isStale && item.isStale()) item = this.queue.shift();
       if (!item) return;
 
-      // Recorded co-driver voice pack, when one is installed and has every word.
-      if (!settings.voiceURI && intercom.ctx && voicePack.canSay(item.text)) {
+      const usePack = !settings.voiceURI && voicePack.loaded;
+      const canStream = !this.streamBroken && voicePack.canStream(item.text);
+      if (usePack && !settings.mixMusic && !this.mediaBlocked && (voicePack.canSay(item.text) || canStream)) {
+        this.playMedia(item);
+        return;
+      }
+
+      // Recorded voice through Web Audio: mixes with other apps' audio.
+      if (usePack && settings.mixMusic && intercom.ctx && voicePack.canSay(item.text)) {
         intercom.ensure();
         const token = {};
         this.current = token;
@@ -231,6 +288,7 @@
         }, this.playing.duration * 1000 + 60);
         return;
       }
+      if (!this.supported) return;
 
       // Phone voice, framed by intercom mic clicks.
       const radio = settings.radio && intercom.ctx && intercom.ctx.state === 'running';
@@ -258,11 +316,80 @@
       }
     },
 
+    // Recorded voice through the <audio> element: rendered with the intercom
+    // effect when the clips could be decoded, otherwise streamed word by word.
+    playMedia(item) {
+      const token = {};
+      this.current = token;
+      const finish = () => {
+        if (this.current !== token) return;
+        clearTimeout(this.watchdog);
+        player.onended = player.onerror = null;
+        this.current = null;
+        this.pump();
+      };
+      // Say this call with the phone voice instead.
+      const fallBack = () => {
+        if (this.current !== token) return;
+        clearTimeout(this.watchdog);
+        player.onended = player.onerror = null;
+        this.current = null;
+        this.queue.unshift(item);
+        this.pump();
+      };
+      const playUrl = (url, onEnd, streaming) => {
+        player.onended = onEnd;
+        player.onerror = () => {
+          // A clip that won't load (no signal, server down): stop relying on clips.
+          if (streaming) this.streamBroken = true;
+          else this.mediaBlocked = true;
+          fallBack();
+        };
+        player.src = url;
+        const p = player.play();
+        if (p && p.catch) {
+          p.catch(err => {
+            if (err && err.name === 'AbortError') return;   // replaced by the next clip
+            if (err && err.name === 'NotAllowedError') this.mediaBlocked = true;
+            else if (streaming) this.streamBroken = true;
+            else this.mediaBlocked = true;
+            fallBack();
+          });
+        }
+      };
+
+      if (voicePack.canSay(item.text)) {
+        voicePack.render(item.text, settings.radio).then(({ url, duration }) => {
+          if (playerUrl) URL.revokeObjectURL(playerUrl);
+          playerUrl = url;
+          if (this.current !== token) return;
+          if (item.isStale && item.isStale()) return finish();
+          this.watchdog = setTimeout(finish, duration * 1000 + 1500);
+          playUrl(url, finish, false);
+        }, () => {
+          this.mediaBlocked = true;
+          fallBack();
+        });
+        return;
+      }
+      const urls = voicePack.streamUrls(item.text);
+      let i = 0;
+      const next = () => {
+        if (this.current !== token) return;
+        if (i >= urls.length) return finish();
+        playUrl(urls[i++], next, true);
+      };
+      this.watchdog = setTimeout(finish, urls.length * 1500 + 2000);
+      next();
+    },
+
     stop() {
       this.queue = [];
       this.current = null;
       if (this.playing) this.playing.stop();
       this.playing = null;
+      player.onended = player.onerror = null;
+      if (!player.paused) player.pause();
       clearTimeout(this.watchdog);
       // Only cancel when something is queued: some Chrome builds drop a speak()
       // that follows a needless cancel().
@@ -275,50 +402,32 @@
     const english = coDriver.voices.filter(v => /^en\b/i.test(v.lang));
     const list = english.length ? english : coDriver.voices;
     sel.innerHTML = '';
-    sel.appendChild(new Option(voicePack.ready ? 'Recorded co-driver (Higgsfield voice pack)' : 'Auto (British English if available)', ''));
+    sel.appendChild(new Option(voicePack.loaded ? 'Recorded co-driver (Higgsfield voice pack)' : 'Auto (British English if available)', ''));
     for (const v of list) sel.appendChild(new Option(`${v.name} (${v.lang})`, v.voiceURI));
     sel.value = list.some(v => v.voiceURI === settings.voiceURI) ? settings.voiceURI : '';
   }
 
-  // ── Google Maps ──
+  // ── Google routing (only with an API key) ──
 
   let mapsPromise = null;
 
   function loadMaps() {
-    if (!HAS_KEY) return Promise.reject(new Error('Add a Google Maps API key to config.js to build routes (or try the demo stage).'));
+    if (!HAS_KEY) return Promise.reject(new Error('No Google Maps API key'));
     if (!mapsPromise) {
       mapsPromise = new Promise((resolve, reject) => {
         window.__rallyMapsReady = () => resolve(window.google.maps);
-        window.gm_authFailure = () => setStatus('Google rejected the API key. Check that Maps JavaScript API and Routes API are enabled and the key allows this website.', true);
+        window.gm_authFailure = () => console.warn('Google rejected the API key; using OpenStreetMap instead.');
         const s = document.createElement('script');
         s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(KEY)}&v=weekly&loading=async&callback=__rallyMapsReady`;
         s.async = true;
         s.onerror = () => {
           mapsPromise = null;
-          reject(new Error('Could not load Google Maps. Check your internet connection.'));
+          reject(new Error('Could not load Google Maps'));
         };
         document.head.appendChild(s);
       });
     }
     return mapsPromise;
-  }
-
-  const toLL = p => (typeof p.lat === 'function' ? { lat: p.lat(), lng: p.lng() } : { lat: +p.lat, lng: +p.lng });
-
-  // Glue per-step paths into one route path, remembering where each maneuver starts.
-  function joinSteps(steps, fallbackPath, duration) {
-    const path = [];
-    const out = [];
-    for (const st of steps) {
-      const pts = (st.path || []).map(toLL);
-      if (!pts.length) continue;
-      const last = path[path.length - 1];
-      const dup = last && Math.abs(last.lat - pts[0].lat) < 1e-7 && Math.abs(last.lng - pts[0].lng) < 1e-7;
-      out.push({ index: dup ? path.length - 1 : path.length, maneuver: st.maneuver, instruction: st.instruction });
-      for (let i = dup ? 1 : 0; i < pts.length; i++) path.push(pts[i]);
-    }
-    if (path.length < 2) return { path: (fallbackPath || []).map(toLL), steps: [], duration };
-    return { path, steps: out, duration };
   }
 
   // Current Maps JavaScript API routing (needs "Routes API" enabled on the key).
@@ -338,7 +447,7 @@
     for (const leg of r.legs || []) {
       for (const st of leg.steps || []) steps.push({ path: st.path, maneuver: st.maneuver, instruction: st.instructions });
     }
-    return joinSteps(steps, r.path, r.durationMillis ? r.durationMillis / 1000 : null);
+    return P.joinSteps(steps, r.path, r.durationMillis ? r.durationMillis / 1000 : null);
   }
 
   // Deprecated DirectionsService, for older keys that only have "Directions API (Legacy)".
@@ -357,35 +466,69 @@
       duration += leg.duration ? leg.duration.value : 0;
       for (const st of leg.steps) steps.push({ path: st.path, maneuver: st.maneuver, instruction: st.instructions });
     }
-    return joinSteps(steps, r.overview_path, duration || null);
+    return P.joinSteps(steps, r.overview_path, duration || null);
   }
 
-  function friendlyRouteError(err) {
-    const msg = String((err && (err.message || err.code)) || err);
-    if (/NO_ROUTE|ZERO_RESULTS|NOT_FOUND|no route/i.test(msg)) {
-      return new Error("Couldn't find a driving route between those places. Try a more specific address.");
-    }
-    if (/not been used|disabled|not activated|PERMISSION_DENIED|REQUEST_DENIED|not authorized|API key/i.test(msg)) {
-      return new Error('Google refused the route request. In Google Cloud Console, enable "Routes API" for this key (and allow this website if the key is restricted).');
-    }
-    return new Error(`Routing failed: ${msg}`);
-  }
-
-  async function fetchRoute(origin, destination) {
+  async function googleRoute(origin, destination) {
     await loadMaps();
-    let firstError;
     try {
       return await routeWithRoutesLibrary(origin, destination);
     } catch (err) {
-      firstError = err;
       console.warn('Routes library failed, trying the legacy DirectionsService', err);
+      return routeWithDirectionsService(origin, destination);
     }
+  }
+
+  // ── Finding places and routes ──
+
+  // A place is {lat, lng, label} (picked from suggestions or GPS) or {text}.
+  async function toPoint(place, near) {
+    if (place.lat !== undefined) return place;
+    const found = await P.searchPlaces(place.text, near, 1);
+    if (!found.length) throw new Error(`Couldn't find "${place.text}". Try adding the town or state.`);
+    return found[0];
+  }
+
+  async function findRoute(from, to) {
+    if (HAS_KEY) {
+      try {
+        const target = p => (p.lat !== undefined ? { lat: p.lat, lng: p.lng } : p.text);
+        const route = await googleRoute(target(from), target(to));
+        route.provider = 'google';
+        return route;
+      } catch (err) {
+        console.warn('Google routing failed; using OpenStreetMap routing', err);
+      }
+    }
+    const a = await toPoint(from, from.lat !== undefined ? from : lastPos);
+    const b = await toPoint(to, a);
+    const route = await P.routeOsrm(a, b, { avoidHighways: settings.avoidHighways });
+    route.provider = 'osm';
+    route.destinationPoint = { lat: b.lat, lng: b.lng };
+    if (to.text && !to.label) to.label = b.label;
+    return route;
+  }
+
+  function friendlyError(err) {
+    const msg = String((err && err.message) || err);
+    if (/^Couldn't|^Location|^This browser/.test(msg)) return msg;
+    if (/NO_ROUTE|NoRoute|ZERO_RESULTS|NOT_FOUND/i.test(msg)) return "Couldn't find a driving route between those places.";
+    if (/fetch|network|abort|HTTP 5|HTTP 429|Load failed/i.test(msg)) return "Couldn't reach the map servers. Check your signal and try again.";
+    return `Routing failed: ${msg}`;
+  }
+
+  // Lights, signs, cameras and speed limits from OpenStreetMap along the route.
+  async function addRoadFeatures(route, timeoutMs) {
     try {
-      return await routeWithDirectionsService(origin, destination);
-    } catch (err) {
-      console.warn('DirectionsService failed too', err);
-      throw friendlyRouteError(/NOT_FOUND|ZERO_RESULTS/.test(String(err && (err.code || err.message))) ? err : firstError);
+      const prelim = N.buildStage(route);
+      const f = await P.roadFeatures(prelim.samples, { timeoutMs });
+      route.hazards = f.hazards;
+      route.limitWays = f.limitWays;
+      route.features = f.ok ? 'ok' : f.partial ? 'partial' : 'failed';
+    } catch (e) {
+      route.features = 'failed';
     }
+    return route;
   }
 
   function currentPosition() {
@@ -395,123 +538,96 @@
         return;
       }
       navigator.geolocation.getCurrentPosition(
-        p => resolve({ lat: p.coords.latitude, lng: p.coords.longitude }),
+        p => {
+          const here = { lat: p.coords.latitude, lng: p.coords.longitude };
+          rememberPos(here);
+          resolve(here);
+        },
         err => reject(new Error(err.code === 1
-          ? 'Location permission was denied. Allow it, or type a start address.'
-          : 'Could not get your position. Type a start address instead.')),
+          ? 'Location permission was denied. Allow it in Settings, or type a start address.'
+          : "Couldn't get your position. Type a start address instead.")),
         { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 }
       );
     });
   }
 
-  function googleMapsLink(route) {
-    const p = new URLSearchParams({ api: '1', destination: route.destination, travelmode: 'driving', dir_action: 'navigate' });
-    if (typeof route.origin === 'string' && route.origin) p.set('origin', route.origin);
+  function googleMapsLink(dest) {
+    const p = new URLSearchParams({ api: '1', destination: `${dest.lat},${dest.lng}`, travelmode: 'driving', dir_action: 'navigate' });
     return `https://www.google.com/maps/dir/?${p}`;
   }
 
-  // ── Google map display ──
+  // ── Address suggestions ──
 
-  const DARK_STYLE = [
-    { elementType: 'geometry', stylers: [{ color: '#15191f' }] },
-    { elementType: 'labels.text.fill', stylers: [{ color: '#8b95a5' }] },
-    { elementType: 'labels.text.stroke', stylers: [{ color: '#0b0d10' }] },
-    { featureType: 'poi', stylers: [{ visibility: 'off' }] },
-    { featureType: 'transit', stylers: [{ visibility: 'off' }] },
-    { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#2a313c' }] },
-    { featureType: 'road.highway', elementType: 'geometry', stylers: [{ color: '#3a4250' }] },
-    { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#0a1a2a' }] },
-  ];
+  const picked = { origin: null, destination: null };
 
-  const gm = { map: null, Overlay: null, layers: [], car: null };
-
-  async function ensureMap() {
-    await loadMaps();
-    if (gm.map) return gm.map;
-    const { Map, OverlayView } = await google.maps.importLibrary('maps');
-    gm.Overlay = class HtmlOverlay extends OverlayView {
-      constructor(pos, el) {
-        super();
-        this.pos = pos;
-        this.el = el;
-      }
-      onAdd() { this.getPanes().floatPane.appendChild(this.el); }
-      onRemove() { this.el.remove(); }
-      draw() {
-        const proj = this.getProjection();
-        const p = proj && proj.fromLatLngToDivPixel(new google.maps.LatLng(this.pos));
-        if (!p) return;
-        this.el.style.left = `${p.x}px`;
-        this.el.style.top = `${p.y}px`;
-      }
-      setPosition(pos) {
-        this.pos = pos;
-        this.draw();
-      }
+  function attachSuggest(input, list, key) {
+    let timer = null;
+    let seq = 0;
+    const hide = () => {
+      list.classList.add('hidden');
+      list.innerHTML = '';
     };
-    gm.map = new Map($('gmap'), {
-      center: { lat: 40.79, lng: -73.13 },
-      zoom: 10,
-      disableDefaultUI: true,
-      zoomControl: true,
-      gestureHandling: 'greedy',
-      clickableIcons: false,
-      backgroundColor: '#07090c',
-      styles: DARK_STYLE,
+    input.addEventListener('input', () => {
+      picked[key] = null;
+      clearTimeout(timer);
+      const q = input.value.trim();
+      if (q.length < 3) {
+        hide();
+        return;
+      }
+      timer = setTimeout(async () => {
+        const mine = ++seq;
+        let results = [];
+        try {
+          results = await P.searchPlaces(q, lastPos, 5, { typing: true });
+        } catch (e) { /* offline: just no suggestions */ }
+        if (mine !== seq || document.activeElement !== input) return;
+        list.innerHTML = '';
+        for (const r of results) {
+          const li = document.createElement('li');
+          li.textContent = r.label;
+          li.addEventListener('pointerdown', e => {
+            e.preventDefault();
+            input.value = r.label;
+            picked[key] = r;
+            if (key === 'origin') $('btn-here').classList.remove('on');
+            hide();
+          });
+          list.appendChild(li);
+        }
+        list.classList.toggle('hidden', !results.length);
+      }, 400);
     });
-    return gm.map;
+    input.addEventListener('blur', () => setTimeout(hide, 150));
   }
 
-  function placeMap(slotId) {
-    $(slotId).appendChild($('gmap'));
+  // ── Street maps ──
+
+  const maps = { google: null, leaflet: null, active: null };
+
+  function mapFor(route) {
+    if (!route || route.synthetic) return null;
+    if (route.provider === 'google' && HAS_KEY) return maps.google || (maps.google = MV.googleMap($('gmap'), loadMaps));
+    if (!window.L) return null;
+    return maps.leaflet || (maps.leaflet = MV.leafletMap($('lmap')));
   }
 
-  function drawStageOnMap(stage) {
-    const map = gm.map;
-    gm.layers.forEach(l => l.setMap(null));
-    gm.layers = [];
-    const S = stage.samples;
-    const slice = (a, b) => S.slice(N.indexAt(S, a), N.indexAt(S, b) + 2).map(p => ({ lat: p.lat, lng: p.lng }));
-
-    gm.layers.push(new google.maps.Polyline({
-      map, path: S.map(p => ({ lat: p.lat, lng: p.lng })), strokeColor: '#ffcc00', strokeOpacity: 0.55, strokeWeight: 5,
-    }));
-    for (const n of stage.notes) {
-      if (n.type !== 'corner') continue;
-      gm.layers.push(new google.maps.Polyline({
-        map, path: slice(n.start, n.end), strokeColor: noteColor(n), strokeOpacity: 1, strokeWeight: 7, zIndex: 2,
-      }));
-    }
-    for (const n of stage.notes) {
-      const el = document.createElement('div');
-      el.className = 'map-label';
-      el.style.background = noteColor(n);
-      el.textContent = n.kind === 'finish' ? '🏁' : shortLabel(n).replace('⚠ ', '');
-      const overlay = new gm.Overlay(N.pointAt(S, n.apex !== undefined ? n.apex : n.start), el);
-      overlay.setMap(map);
-      gm.layers.push(overlay);
-    }
-
-    let north = -90, south = 90, east = -180, west = 180;
-    for (const p of S) {
-      north = Math.max(north, p.lat); south = Math.min(south, p.lat);
-      east = Math.max(east, p.lng); west = Math.min(west, p.lng);
-    }
-    map.fitBounds({ north, south, east, west }, 30);
+  async function showMapIn(slotId) {
+    const m = mapFor(state.route);
+    if (!m) throw new Error('No map');
+    await m.ready();
+    $(slotId).appendChild($(m.kind === 'google' ? 'gmap' : 'lmap'));
+    m.resize();
+    maps.active = m;
+    return m;
   }
 
   function updateMapCar(s) {
-    if (!gm.map || state.view !== 'map') return;
+    const m = maps.active;
+    if (!m || state.view !== 'map') return;
     const p = N.pointAt(state.stage.samples, s);
-    if (!gm.car) {
-      const el = document.createElement('div');
-      el.className = 'map-car';
-      gm.car = new gm.Overlay(p, el);
-      gm.car.setMap(gm.map);
-    }
-    gm.car.setPosition(p);
-    gm.car.el.style.transform = `rotate(${N.headingAt(state.stage.samples, s, 15)}deg)`;
-    gm.map.panTo(p);
+    m.setCar(p, N.headingAt(state.stage.samples, s, 15));
+    m.follow(p);
   }
 
   // ── Canvas stage views ──
@@ -599,7 +715,7 @@
       return out;
     }
 
-    // Whole stage, north up — used on the briefing screen without a Google map.
+    // Whole stage, north up — used on the briefing screen without a street map.
     drawOverview() {
       if (!this.stage || !this.fit()) return;
       this.clear();
@@ -629,10 +745,10 @@
 
       const placed = [];
       this.label(end[0], end[1] - 16, 'FINISH', '#ffffff', placed);
-      const order = notes.filter(n => n.type === 'corner').sort((a, b) => severity(a) - severity(b));
+      const order = notes.filter(n => n.kind !== 'finish').sort((a, b) => severity(a) - severity(b));
       for (const n of order) {
         const p = project(this.xy[N.indexAt(this.stage.samples, n.apex)]);
-        this.label(p[0], p[1] - 16, shortLabel(n).replace('⚠ ', ''), noteColor(n), placed);
+        this.label(p[0], p[1] - 16, MAP_STYLE.label(n), noteColor(n), placed);
       }
     }
 
@@ -677,8 +793,15 @@
         }
         if (n.start < s) continue;
         const p = project(this.xy[N.indexAt(S, n.start)]);
+        if (n.type === 'event' && HAZARD_COLORS[n.kind]) {
+          // A bar across the road where the light, sign or camera is.
+          const q = project(this.xy[Math.min(S.length - 1, N.indexAt(S, n.start) + 2)]);
+          const ang = Math.atan2(q[1] - p[1], q[0] - p[0]) + Math.PI / 2;
+          const dx = Math.cos(ang) * (roadW * 0.7), dy = Math.sin(ang) * (roadW * 0.7);
+          this.line([[p[0] - dx, p[1] - dy], [p[0] + dx, p[1] + dy]], noteColor(n), 5);
+        }
         const side = n.dir === 'L' ? -1 : 1;
-        this.label(p[0] + side * (roadW + 26), p[1], shortLabel(n).replace('⚠ ', ''), noteColor(n), placed);
+        this.label(p[0] + side * (roadW + 26), p[1], MAP_STYLE.label(n), noteColor(n), placed);
       }
 
       const c = this.ctx;
@@ -698,19 +821,31 @@
     }
   }
 
-  // Lower = slower corner; used to give slow corners label priority.
+  // Lower = more important; used to give slow corners and hazards label priority.
   function severity(n) {
     if (n.kind === 'hairpin') return 0;
+    if (n.kind === 'camera' || n.kind === 'stop') return 0.5;
     if (n.kind === 'square') return 1;
-    return n.grade || 9;
+    if (n.kind === 'corner') return n.grade;
+    return 7;
   }
 
-  // ── Note glyph (the corner arrow on the HUD) ──
+  // ── Note glyphs (the big icon on the HUD) ──
 
   const GLYPH_RADIUS = { hairpin: 10, square: 3, keep: 60, ramp: 60, 1: 12, 2: 17, 3: 24, 4: 32, 5: 44, 6: 60 };
+  const FONT = 'Barlow Condensed, Arial Narrow, Arial, sans-serif';
+
+  const HAZARD_GLYPHS = {
+    lights: c => `<svg viewBox="0 0 100 100"><rect x="33" y="6" width="34" height="88" rx="11" fill="#111" stroke="${c}" stroke-width="5"/><circle cx="50" cy="27" r="10" fill="#ff3b30"/><circle cx="50" cy="50" r="10" fill="#ffcc00"/><circle cx="50" cy="73" r="10" fill="#3ddc84"/></svg>`,
+    stop: () => `<svg viewBox="0 0 100 100"><polygon points="30,5 70,5 95,30 95,70 70,95 30,95 5,70 5,30" fill="#c8102e" stroke="#fff" stroke-width="4"/><text x="50" y="61" text-anchor="middle" font-size="28" font-weight="800" fill="#fff" font-family="${FONT}">STOP</text></svg>`,
+    camera: c => `<svg viewBox="0 0 100 100"><rect x="8" y="30" width="66" height="44" rx="9" fill="none" stroke="${c}" stroke-width="7"/><circle cx="41" cy="52" r="12" fill="none" stroke="${c}" stroke-width="7"/><polygon points="74,42 94,30 94,74 74,62" fill="${c}"/></svg>`,
+    railway: c => `<svg viewBox="0 0 100 100"><g stroke="${c}" stroke-width="13" stroke-linecap="round"><line x1="14" y1="14" x2="86" y2="86"/><line x1="86" y1="14" x2="14" y2="86"/></g></svg>`,
+    bump: c => `<svg viewBox="0 0 100 100"><path d="M6 72 H26 Q50 18 74 72 H94" fill="none" stroke="${c}" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  };
 
   function glyphSVG(n) {
     const color = noteColor(n);
+    if (HAZARD_GLYPHS[n.kind]) return HAZARD_GLYPHS[n.kind](color);
     if (n.kind === 'finish') {
       let cells = '';
       for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) if ((r + c) % 2 === 0) cells += `<rect x="${18 + c * 16}" y="${18 + r * 16}" width="16" height="16" fill="#fff"/>`;
@@ -719,11 +854,11 @@
     if (n.kind === 'roundabout') {
       return `<svg viewBox="0 0 100 100"><circle cx="50" cy="44" r="24" fill="none" stroke="${color}" stroke-width="9"/>
         <line x1="50" y1="96" x2="50" y2="70" stroke="${color}" stroke-width="9" stroke-linecap="round"/>
-        <text x="50" y="52" text-anchor="middle" font-size="26" font-weight="800" fill="${color}" font-family="Barlow Condensed, sans-serif">${n.exit || ''}</text></svg>`;
+        <text x="50" y="52" text-anchor="middle" font-size="26" font-weight="800" fill="${color}" font-family="${FONT}">${n.exit || ''}</text></svg>`;
     }
     if (!n.dir) {
       const word = n.kind === 'merge' ? 'MERGE' : n.kind === 'ferry' ? 'FERRY' : '';
-      return `<svg viewBox="0 0 100 100"><text x="50" y="60" text-anchor="middle" font-size="26" font-weight="800" fill="${color}" font-family="Barlow Condensed, sans-serif">${word}</text></svg>`;
+      return `<svg viewBox="0 0 100 100"><text x="50" y="60" text-anchor="middle" font-size="26" font-weight="800" fill="${color}" font-family="${FONT}">${word}</text></svg>`;
     }
 
     const angle = n.kind === 'keep' || n.kind === 'ramp' ? 30 : Math.max(25, Math.min(180, n.angle || 90));
@@ -789,17 +924,37 @@
     renderBrief();
   }
 
+  // "8 traffic lights · 1 speed camera · speed limits on 90% of the route"
+  function featureSummary(route, stage) {
+    if (route.synthetic) return 'Demo stage: a made-up road for trying the co-driver. Use “Simulate drive”.';
+    const count = {};
+    for (const n of stage.notes) {
+      if (HAZARD_SHORT[n.kind]) count[n.kind] = (count[n.kind] || 0) + 1;
+      if (n.at) count[n.at] = (count[n.at] || 0) + 1;
+    }
+    const words = { lights: ['traffic light', 'traffic lights'], stop: ['stop sign', 'stop signs'], camera: ['speed camera', 'speed cameras'], railway: ['rail crossing', 'rail crossings'], bump: ['speed bump', 'speed bumps'] };
+    const parts = Object.keys(words).filter(k => count[k]).map(k => `${count[k]} ${words[k][count[k] === 1 ? 0 : 1]}`);
+    const covered = (stage.limits || []).reduce((sum, sp) => sum + (sp.end - sp.start), 0);
+    if (covered > 0) parts.push(`speed limits on ${Math.min(100, Math.round((covered / stage.length) * 100))}% of the route`);
+    const source = route.provider === 'google' ? 'Route by Google Maps' : 'Route by OpenStreetMap (OSRM)';
+    let features;
+    if (route.features === 'failed') features = 'Couldn’t load traffic lights and speed limits right now (map data server busy).';
+    else features = parts.length ? parts.join(' · ') : 'No traffic lights, signs or speed limits mapped on this route.';
+    if (route.features === 'partial') features += ' (first part of the route only)';
+    return `${source}. ${features}`;
+  }
+
   async function renderBrief() {
     const { route, stage } = state;
     $('brief-title').textContent = route.name;
 
     const duration = route.duration || estimateSimTime(stage);
-    const perUnit = stage.stats.corners / Math.max(0.1, toDistUnit(stage.length));
+    const alerts = stage.notes.filter(n => HAZARD_SHORT[n.kind] || n.at).length;
     const stats = [
       [fmtDist(stage.length), 'distance'],
       [fmtDuration(duration), 'drive time'],
       [stage.stats.corners, 'corners'],
-      [perUnit.toFixed(1), `per ${distUnit()}`],
+      [alerts, 'road alerts'],
     ];
     $('brief-stats').innerHTML = '';
     for (const [value, label] of stats) {
@@ -809,34 +964,48 @@
       d.lastChild.textContent = label;
       $('brief-stats').appendChild(d);
     }
+    $('brief-note').textContent = featureSummary(route, stage);
+    const attrib = $('attrib');
+    attrib.textContent = route.synthetic ? '' : `${route.provider === 'google' ? 'Route © Google · ' : ''}${P.ATTRIBUTION} · `;
+    if (!route.synthetic) {
+      const fix = document.createElement('a');
+      fix.href = 'https://www.openstreetmap.org/fixthemap';
+      fix.target = '_blank';
+      fix.rel = 'noopener';
+      fix.textContent = 'Something wrong on the map? Fix it';
+      attrib.appendChild(fix);
+    }
 
-    $('btn-start').classList.toggle('hidden', !!route.synthetic);
-    $('btn-sim').classList.toggle('btn-go', !!route.synthetic);
-    $('btn-sim').classList.toggle('btn-alt', !route.synthetic);
-    $('btn-sim').style.gridColumn = route.synthetic ? '1 / -1' : '';
-    const gl = $('btn-gmaps');
-    gl.classList.toggle('hidden', !!route.synthetic);
-    if (!route.synthetic) gl.href = googleMapsLink(route);
+    const real = !route.synthetic;
+    $('btn-start').classList.toggle('hidden', !real);
+    $('btn-sim').classList.toggle('btn-go', !real);
+    $('btn-sim').classList.toggle('btn-alt', real);
+    $('btn-gmaps').classList.toggle('hidden', !real);
+    $('btn-waze').classList.toggle('hidden', !real);
+    if (real) {
+      const dest = route.destinationPoint || route.path[route.path.length - 1];
+      $('btn-gmaps').href = googleMapsLink(dest);
+      $('btn-waze').href = P.wazeLink(dest);
+    }
 
     renderBook();
 
     overview.setStage(stage);
-    const useGoogle = !route.synthetic && HAS_KEY;
-    $('overview').classList.toggle('hidden', useGoogle);
-    $('map-slot-brief').classList.toggle('hidden', !useGoogle);
-    if (useGoogle) {
+    const m = mapFor(route);
+    $('overview').classList.toggle('hidden', !!m);
+    $('map-slot-brief').classList.toggle('hidden', !m);
+    if (m) {
       try {
-        await ensureMap();
-        placeMap('map-slot-brief');
-        drawStageOnMap(stage);
+        await showMapIn('map-slot-brief');
+        m.drawStage(stage, MAP_STYLE);
+        return;
       } catch (e) {
+        console.warn('Street map unavailable', e);
         $('overview').classList.remove('hidden');
         $('map-slot-brief').classList.add('hidden');
-        overview.drawOverview();
       }
-    } else {
-      overview.drawOverview();
     }
+    overview.drawOverview();
   }
 
   function renderBook() {
@@ -885,7 +1054,6 @@
       noteIdx: 0,
       shownNote: null,
       lastCall: '',
-      callsMade: 0,
       finished: false,
       endArmed: false,
     });
@@ -896,10 +1064,10 @@
     $('sim-badge').classList.toggle('hidden', mode !== 'sim');
     $('gps-chip').classList.toggle('hidden', mode !== 'gps');
     $('btn-speed').classList.toggle('hidden', mode !== 'sim');
-    $('btn-view').classList.toggle('hidden', !!state.route.synthetic || !HAS_KEY);
-    $('btn-end').firstChild.textContent = '■';
+    $('btn-view').classList.toggle('hidden', !mapFor(state.route));
     $('stat-speed-unit').textContent = speedUnit();
     $('stat-left-unit').textContent = `${distUnit()} left`;
+    $('limit-sign').classList.add('hidden');
     setAlert(null);
     requestWakeLock();
 
@@ -946,6 +1114,8 @@
     tick();
   }
 
+  let lastPosSave = 0;
+
   function onFix(fix) {
     if (state.finished || state.rerouting) return;
     const pos = state.tracker.update(fix);
@@ -955,7 +1125,13 @@
     // Only trust top speed from a decent fix.
     if (!fix.accuracy || fix.accuracy <= 30) state.topSpeed = Math.max(state.topSpeed, state.speed);
     state.lastFixAt = performance.now();
-    if (state.mode === 'gps') setAlert(pos.offRoute ? 'OFF ROUTE' : null);
+    if (state.mode === 'gps') {
+      setAlert(pos.offRoute ? 'OFF ROUTE' : null);
+      if (state.lastFixAt - lastPosSave > 60000) {
+        lastPosSave = state.lastFixAt;
+        rememberPos(fix);
+      }
+    }
 
     if (pos.offRoute) {
       reroute(fix);
@@ -966,7 +1142,6 @@
     const schedSpeed = state.mode === 'sim' ? state.speed * state.simRate : state.speed;
     for (const call of state.scheduler.update(pos.s, schedSpeed)) {
       state.lastCall = call.text;
-      state.callsMade++;
       coDriver.say(call.text, () => state.s > call.start + 5);
       const card = $('note-card');
       card.classList.remove('flash');
@@ -987,8 +1162,10 @@
     coDriver.say('Off route. Recalculating.');
     try {
       const old = state.route;
-      const route = await fetchRoute({ lat: fix.lat, lng: fix.lng }, old.destination);
-      Object.assign(route, { name: old.name, origin: old.origin, destination: old.destination });
+      const dest = old.destinationPoint || old.path[old.path.length - 1];
+      const route = await findRoute({ lat: fix.lat, lng: fix.lng, label: 'Here' }, { lat: dest.lat, lng: dest.lng, label: old.destLabel });
+      await addRoadFeatures(route, 8000);
+      Object.assign(route, { name: old.name, destinationPoint: dest, destLabel: old.destLabel });
       const stage = N.buildStage(route);
       Object.assign(state, {
         route,
@@ -1000,7 +1177,7 @@
         s: 0,
       });
       chase.setStage(stage);
-      if (gm.map) drawStageOnMap(stage);
+      if (maps.active && mapFor(route) === maps.active) maps.active.drawStage(stage, MAP_STYLE);
       setAlert(null);
       coDriver.say('New route. Notes on.');
     } catch (err) {
@@ -1064,6 +1241,7 @@
     $('stat-speed').textContent = stale ? '--' : toSpeedUnit(state.speed);
     $('stat-top').textContent = state.topSpeed > 0 ? `top ${toSpeedUnit(state.topSpeed)}` : '';
     if (state.mode === 'gps') updateGpsChip(stale);
+    updateLimit(s, stale);
     $('stat-time').textContent = fmtClock(elapsed());
     $('stat-left').textContent = toDistUnit(Math.max(0, stage.length - s)).toFixed(1);
     $('progress-bar').style.width = `${Math.min(100, (s / stage.length) * 100)}%`;
@@ -1072,6 +1250,27 @@
       lastMapPan = now;
       updateMapCar(s);
     }
+  }
+
+  // Posted speed limit (from OpenStreetMap) and the speedo turning red above it.
+  function updateLimit(s, stale) {
+    const lim = N.limitAt(state.stage, s);
+    const sign = $('limit-sign');
+    const speedEl = $('stat-speed');
+    if (!lim) {
+      sign.classList.add('hidden');
+      speedEl.classList.remove('over');
+      return;
+    }
+    const mph = settings.units === 'mph';
+    const native = mph ? lim.unit === 'mph' : lim.unit === 'km/h';
+    const shown = native ? lim.value : Math.round((lim.mps * MPS_TO[settings.units]) / 5) * 5;
+    sign.classList.remove('hidden');
+    sign.classList.toggle('round', !mph);
+    const valueEl = $('limit-value');
+    if (valueEl.textContent !== String(shown)) valueEl.textContent = shown;
+    const tolerance = mph ? 3 * 0.44704 : 5 / 3.6;
+    speedEl.classList.toggle('over', !stale && state.speed > lim.mps + tolerance);
   }
 
   function updateGpsChip(stale) {
@@ -1099,9 +1298,9 @@
     $('btn-view').lastChild.textContent = map ? 'Notes' : 'Map';
     if (map) {
       try {
-        await ensureMap();
-        placeMap('map-slot-drive');
-        gm.map.setZoom(17);
+        const m = await showMapIn('map-slot-drive');
+        const p = N.pointAt(state.stage.samples, state.s);
+        m.follow(p, 17);
         updateMapCar(state.s);
       } catch (e) {
         setView('chase');
@@ -1117,10 +1316,7 @@
     state.simTimer = null;
     state.watchId = null;
     $('countdown').classList.add('hidden');
-    if (gm.car) {
-      gm.car.setMap(null);
-      gm.car = null;
-    }
+    if (maps.active) maps.active.clearCar();
     releaseWakeLock();
   }
 
@@ -1171,15 +1367,59 @@
 
   // ── Wiring ──
 
+  async function buildStageFromForm() {
+    const destText = $('destination').value.trim();
+    const originText = $('origin').value.trim();
+    if (!destText) return;
+    const btn = $('btn-build');
+    btn.disabled = true;
+    try {
+      let from;
+      if (picked.origin && picked.origin.label === originText) from = picked.origin;
+      else if (originText) from = { text: originText };
+      else {
+        setStatus('Finding your position…');
+        from = Object.assign(await currentPosition(), { label: 'My location' });
+      }
+      const to = picked.destination && picked.destination.label === destText ? Object.assign({}, picked.destination) : { text: destText };
+
+      setStatus('Finding the fastest route…');
+      const route = await findRoute(from, to);
+      setStatus('Checking traffic lights, signs and speed limits…');
+      await addRoadFeatures(route, 20000);
+      const end = route.path[route.path.length - 1];
+      Object.assign(route, {
+        name: `${shortPlace(from.label || from.text)} → ${shortPlace(to.label || to.text)}`,
+        destinationPoint: route.destinationPoint || (to.lat !== undefined ? { lat: to.lat, lng: to.lng } : end),
+        destLabel: to.label || to.text,
+      });
+      writeStore('rally.lastDestination', destText);
+      writeStore('rally.lastOrigin', originText);
+      setStatus('');
+      loadStage(route);
+    } catch (err) {
+      console.warn(err);
+      setStatus(friendlyError(err), true);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   function initSetup() {
-    $('key-hint').classList.toggle('hidden', HAS_KEY);
+    $('key-hint').textContent = HAS_KEY
+      ? 'Routing with Google Maps (falls back to OpenStreetMap if Google fails).'
+      : 'Routing with free OpenStreetMap data — no account or key needed.';
     $('destination').value = readStore('rally.lastDestination', '');
     $('origin').value = readStore('rally.lastOrigin', '');
     $('btn-here').classList.toggle('on', !$('origin').value);
     $('avoid-highways').checked = !!settings.avoidHighways;
 
+    attachSuggest($('origin'), $('suggest-origin'), 'origin');
+    attachSuggest($('destination'), $('suggest-destination'), 'destination');
+
     $('btn-here').addEventListener('click', () => {
       $('origin').value = '';
+      picked.origin = null;
       $('btn-here').classList.add('on');
       $('destination').focus();
     });
@@ -1189,29 +1429,11 @@
       saveSettings();
     });
 
-    $('route-form').addEventListener('submit', async e => {
+    $('route-form').addEventListener('submit', e => {
       e.preventDefault();
-      const destination = $('destination').value.trim();
-      const originText = $('origin').value.trim();
-      if (!destination) return;
-      const btn = $('btn-build');
-      btn.disabled = true;
-      try {
-        if (!HAS_KEY) throw new Error('Add a Google Maps API key to config.js to build real routes. Meanwhile, try the demo stage below.');
-        setStatus(originText ? 'Asking Google for the route…' : 'Finding your position…');
-        const origin = originText || await currentPosition();
-        setStatus('Asking Google for the route…');
-        const route = await fetchRoute(origin, destination);
-        Object.assign(route, { name: `${originText || 'My location'} → ${destination}`, origin, destination });
-        writeStore('rally.lastDestination', destination);
-        writeStore('rally.lastOrigin', originText);
-        setStatus('');
-        loadStage(route);
-      } catch (err) {
-        setStatus(err.message, true);
-      } finally {
-        btn.disabled = false;
-      }
+      // Unlock audio now, inside the tap, so the briefing can talk.
+      coDriver.unlock();
+      buildStageFromForm();
     });
 
     $('btn-demo').addEventListener('click', () => {
@@ -1249,6 +1471,11 @@
       settings.radio = e.target.checked;
       saveSettings();
     });
+    $('mix-music').checked = !!settings.mixMusic;
+    $('mix-music').addEventListener('change', e => {
+      settings.mixMusic = e.target.checked;
+      saveSettings();
+    });
     $('btn-test-voice').addEventListener('click', () => {
       coDriver.stop();
       coDriver.unlock();
@@ -1275,6 +1502,7 @@
     });
     window.addEventListener('resize', () => {
       if (state.screen === 'brief' && !$('overview').classList.contains('hidden')) overview.drawOverview();
+      if (maps.active) maps.active.resize();
     });
   }
 
@@ -1324,13 +1552,14 @@
     $('btn-new').addEventListener('click', () => show('setup'));
   }
 
-  // A recorded voice pack is optional; without voice/manifest.json nothing loads.
+  // The recorded voice pack is optional; without voice/manifest.json nothing loads.
   async function loadVoicePack() {
     try {
       const res = await fetch('voice/manifest.json', { method: 'HEAD', cache: 'no-cache' });
       if (!res.ok || !intercom.supported) return;
       intercom.ensure();
-      if (await voicePack.load(intercom.ctx)) fillVoiceSelect();
+      await voicePack.load(intercom.ctx);
+      fillVoiceSelect();
     } catch (e) { /* offline or no pack */ }
   }
 

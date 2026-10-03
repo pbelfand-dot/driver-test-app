@@ -4,7 +4,7 @@
  * the last good copy is served when offline. Google Maps and routing requests
  * are never cached; they always go to the network.
  */
-const CACHE = 'rally-v1';
+const CACHE = 'rally-v2';
 const SHELL = [
   './',
   'index.html',
@@ -13,6 +13,10 @@ const SHELL = [
   'pacenotes.js',
   'demo-stage.js',
   'voicepack.js',
+  'providers.js',
+  'mapview.js',
+  'vendor/leaflet/leaflet.js',
+  'vendor/leaflet/leaflet.css',
   'manifest.webmanifest',
   'icons/icon-192.png',
   'icons/icon-512.png',
@@ -35,6 +39,17 @@ self.addEventListener('fetch', event => {
   const req = event.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
+  // Recorded voice clips never change: serve them from the cache once fetched.
+  if (/\.cloudfront\.net$/.test(url.hostname) && /\.(wav|mp3)$/.test(url.pathname)) {
+    event.respondWith(caches.match(req).then(hit => hit || fetch(req).then(res => {
+      if (res.ok) {
+        const copy = res.clone();
+        caches.open(CACHE).then(c => c.put(req, copy));
+      }
+      return res;
+    })));
+    return;
+  }
   const isFont = /^fonts\.(googleapis|gstatic)\.com$/.test(url.hostname);
   if (url.origin !== self.location.origin && !isFont) return;
 
