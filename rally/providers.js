@@ -158,11 +158,14 @@
       }
     }
     const overview = ((r.geometry && r.geometry.coordinates) || []).map(([lng, lat]) => ({ lat, lng }));
-    return joinSteps(steps, overview, r.duration || null);
+    const route = joinSteps(steps, overview, r.duration || null);
+    route.distance = r.distance || null;
+    return route;
   }
 
+  // opts.via: stops to pass through on the way, in order.
   async function routeOsrm(origin, destination, opts = {}) {
-    const coords = `${origin.lng.toFixed(6)},${origin.lat.toFixed(6)};${destination.lng.toFixed(6)},${destination.lat.toFixed(6)}`;
+    const coords = [origin, ...(opts.via || []), destination].map(p => `${p.lng.toFixed(6)},${p.lat.toFixed(6)}`).join(';');
     // FOSSGIS has hints disabled and asks clients not to request them.
     const base = 'overview=full&geometries=geojson&steps=true&generate_hints=false';
     const queries = opts.avoidHighways ? [`${base}&exclude=motorway`, base] : [base];
