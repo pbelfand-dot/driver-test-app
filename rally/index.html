@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0d10" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Rally Co-Driver GPS</title>
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" type="image/png" href="icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,500;0,700;0,800;1,800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="rally.css" />
+</head>
+<body>
+
+  <!-- ── Setup ─────────────────────────────────────────── -->
+  <section id="screen-setup" class="screen active">
+    <header class="brand">
+      <div class="brand-stripes"><span></span><span></span><span></span></div>
+      <h1>RALLY <em>CO-DRIVER</em></h1>
+      <p>GPS pace notes for your route</p>
+    </header>
+
+    <form id="route-form" class="panel" autocomplete="on">
+      <label class="field">
+        <span>From</span>
+        <div class="input-row">
+          <input id="origin" type="text" placeholder="Current location" autocomplete="street-address" />
+          <button type="button" id="btn-here" class="chip-btn" title="Use my current location">📍 Here</button>
+        </div>
+      </label>
+      <label class="field">
+        <span>To</span>
+        <input id="destination" type="text" placeholder="Address, place or town" required />
+      </label>
+      <label class="toggle">
+        <input id="avoid-highways" type="checkbox" />
+        <span>Twisty mode: avoid highways</span>
+      </label>
+      <button type="submit" id="btn-build" class="btn btn-go">Build stage</button>
+      <p id="setup-status" class="status" role="status"></p>
+    </form>
+
+    <button id="btn-demo" class="btn btn-ghost">Demo stage <small>no key needed</small></button>
+    <p id="key-hint" class="hint hidden">
+      Routing needs a Google Maps API key. Put it in <code>config.js</code> and enable
+      <b>Maps JavaScript API</b> and <b>Routes API</b> for it. The demo stage works without one.
+    </p>
+
+    <details class="panel settings">
+      <summary>Co-driver settings</summary>
+      <label class="field">
+        <span>Voice</span>
+        <select id="voice"></select>
+      </label>
+      <label class="field">
+        <span>Reading speed <output id="rate-out">1.1×</output></span>
+        <input id="rate" type="range" min="0.8" max="1.6" step="0.05" value="1.1" />
+      </label>
+      <div class="field">
+        <span>Call notes</span>
+        <div class="segmented" id="timing">
+          <button type="button" data-value="early">Early</button>
+          <button type="button" data-value="normal">Normal</button>
+          <button type="button" data-value="late">Late</button>
+        </div>
+      </div>
+      <div class="field">
+        <span>Speed units</span>
+        <div class="segmented" id="units">
+          <button type="button" data-value="mph">mph</button>
+          <button type="button" data-value="kmh">km/h</button>
+        </div>
+      </div>
+      <label class="toggle">
+        <input id="radio" type="checkbox" checked />
+        <span>Radio intercom effect (mic clicks &amp; static)</span>
+      </label>
+      <button type="button" id="btn-test-voice" class="btn btn-small">▶ Test voice</button>
+    </details>
+
+    <aside class="legend panel">
+      <h2>How to read the notes</h2>
+      <ul>
+        <li><b>3 left</b>: a bend's number, then its direction</li>
+        <li><b class="g6">6</b> fastest bend … <b class="g1">1</b> slowest bend</li>
+        <li><b class="gsq">Square</b> ≈ 90° junction turn · <b class="ghp">Hairpin</b> ≈ 180°</li>
+        <li><b>tightens / opens</b> the bend gets slower / faster on the way through</li>
+        <li><b>100, 200…</b> metres of straight to the next note · <b>into / and</b> right after</li>
+        <li><b>Caution</b> slow bend at the end of a long straight</li>
+      </ul>
+      <p class="safety">Notes describe the road's shape, not a safe speed. Obey speed limits and traffic laws, and keep your eyes on the road.</p>
+    </aside>
+  </section>
+
+  <!-- ── Briefing (recce) ─────────────────────────────── -->
+  <section id="screen-brief" class="screen">
+    <header class="bar">
+      <button class="icon-btn" id="btn-brief-back" aria-label="Back">‹</button>
+      <h2 id="brief-title">Stage</h2>
+    </header>
+    <div class="brief-map">
+      <div id="map-slot-brief" class="map-slot"></div>
+      <canvas id="overview" class="stage-canvas"></canvas>
+    </div>
+    <div class="brief-stats" id="brief-stats"></div>
+    <div class="brief-actions">
+      <button id="btn-start" class="btn btn-go">▶ Start stage</button>
+      <button id="btn-sim" class="btn btn-alt">Simulate drive</button>
+      <a id="btn-gmaps" class="btn btn-ghost" target="_blank" rel="noopener">Open in Google Maps</a>
+    </div>
+    <h3 class="book-title">Pace notes <small>tap to hear a call</small></h3>
+    <ol id="book" class="book"></ol>
+  </section>
+
+  <!-- ── Drive HUD ────────────────────────────────────── -->
+  <section id="screen-drive" class="screen">
+    <div class="hud-top">
+      <div id="note-card" class="note-card">
+        <div id="note-glyph" class="glyph"></div>
+        <div class="note-body">
+          <div id="note-text" class="note-text">READY</div>
+          <div id="note-street" class="note-street"></div>
+        </div>
+        <div id="note-dist" class="note-dist"></div>
+      </div>
+      <div id="next-strip" class="next-strip"></div>
+    </div>
+
+    <div class="drive-view">
+      <canvas id="chase" class="stage-canvas"></canvas>
+      <div id="map-slot-drive" class="map-slot hidden"></div>
+      <div id="offroute" class="offroute hidden">OFF ROUTE</div>
+      <div id="countdown" class="countdown hidden"></div>
+      <div id="sim-badge" class="sim-badge hidden">SIMULATION</div>
+      <div id="gps-chip" class="gps-chip hidden">GPS</div>
+    </div>
+
+    <div class="hud-bottom">
+      <div class="progress"><div id="progress-bar"></div></div>
+      <div class="stats">
+        <div class="speed"><b id="stat-speed">0</b><span id="stat-speed-unit">mph</span><small id="stat-top"></small></div>
+        <div><b id="stat-time">0:00</b><span>time</span></div>
+        <div><b id="stat-left">0.0</b><span id="stat-left-unit">mi left</span></div>
+      </div>
+      <div class="controls">
+        <button id="btn-mute" class="ctrl" aria-pressed="false">🔊<span>Voice</span></button>
+        <button id="btn-repeat" class="ctrl">⟲<span>Repeat</span></button>
+        <button id="btn-view" class="ctrl">🗺<span>Map</span></button>
+        <button id="btn-speed" class="ctrl hidden">1×<span>Sim</span></button>
+        <button id="btn-end" class="ctrl ctrl-end">■<span>End</span></button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Finish ───────────────────────────────────────── -->
+  <section id="screen-finish" class="screen">
+    <div class="finish">
+      <div class="flag"></div>
+      <h2>STAGE COMPLETE</h2>
+      <div id="finish-stats" class="finish-stats"></div>
+      <button id="btn-again" class="btn btn-go">Run it again</button>
+      <button id="btn-new" class="btn btn-ghost">New stage</button>
+    </div>
+  </section>
+
+  <div id="gmap" class="gmap"></div>
+
+  <script src="../config.js"></script>
+  <script src="pacenotes.js"></script>
+  <script src="demo-stage.js"></script>
+  <script src="voicepack.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
