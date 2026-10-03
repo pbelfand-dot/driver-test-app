@@ -1,0 +1,42 @@
+# Copies the rally co-driver's recorded voice clips into the repo (rally/voice/)
+# so the app serves them itself from GitHub Pages. Free for public repos.
+name: Store voice pack
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - rally/voice/manifest.json
+      - rally/voice/build-pack.js
+      - .github/workflows/voice-pack.yml
+
+permissions:
+  contents: write
+
+jobs:
+  store:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Download and convert clips
+        run: node rally/voice/build-pack.js
+
+      - name: Commit clips
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add rally/voice
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "Store rally voice pack clips in the repo"
+            git push
+          fi
